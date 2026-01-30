@@ -17,12 +17,13 @@ WORKDIR /app
 COPY . /app
 
 # Install dependencies and the local package in editable mode
-# This ensures we use the local code with header support, not PyPI version
+# This ensures we use the local code with header support and circular import fix
 RUN uv sync --locked --no-dev
 
-# Set PATH to include venv bin directory
-ENV PATH="/app/.venv/bin:${PATH}"
+# Set PATH to include venv bin directory and uv's bin
+ENV PATH="/app/.venv/bin:/root/.local/bin:${PATH}"
 
-# Run the server directly using the installed command (uses local editable install)
-# This is equivalent to uvx but ensures we use the local code
-CMD ["sh", "-c", "mcp-server-snowflake --service-config-file /app/services/tools_config.yaml --transport streamable-http --port ${PORT:-9000}"]
+# Use uv run to execute the command (equivalent to uvx but uses local editable install)
+# This ensures we use the local code with circular import fix, not PyPI version
+# uv run is similar to uvx but uses the current environment instead of creating a new one
+CMD ["sh", "-c", "uv run snowflake-labs-mcp --service-config-file /app/services/tools_config.yaml --transport streamable-http --port ${PORT:-9000}"]

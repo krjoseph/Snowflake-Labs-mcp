@@ -40,7 +40,10 @@ from mcp_server_snowflake.query_manager.tools import initialize_query_manager_to
 from mcp_server_snowflake.semantic_manager.tools import (
     initialize_semantic_manager_tools,
 )
-from mcp_server_snowflake.server_utils import initialize_middleware
+from mcp_server_snowflake.server_utils import (
+    initialize_middleware,
+    request_connection_params,
+)
 from mcp_server_snowflake.utils import (
     cleanup_snowflake_service,
     get_login_params,
@@ -56,11 +59,6 @@ tag_minor_version = 3
 query_tag = {"origin": "sf_sit", "name": "mcp_server"}
 
 logger = get_logger(server_name)
-
-# Context variable to store per-request connection parameters from headers
-request_connection_params: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
-    "request_connection_params", default=None
-)
 
 
 class ConnectionPool:

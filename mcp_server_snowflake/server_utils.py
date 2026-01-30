@@ -1,16 +1,24 @@
+from contextvars import ContextVar
+from typing import Any, Dict, Optional
+
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from mcp_server_snowflake.object_manager.tools import validate_object_tool
 from mcp_server_snowflake.query_manager.tools import validate_sql_type
-from mcp_server_snowflake.server import request_connection_params
 
 try:
     from starlette.requests import Request
     STARLETTE_AVAILABLE = True
 except ImportError:
     STARLETTE_AVAILABLE = False
+
+# Context variable to store per-request connection parameters from headers
+# Defined here to avoid circular import with server.py
+request_connection_params: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "request_connection_params", default=None
+)
 
 
 class HeaderConnectionMiddleware(Middleware):
