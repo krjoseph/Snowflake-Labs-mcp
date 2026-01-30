@@ -4,7 +4,7 @@
   "description": "MCP Server for Snowflake from Snowflake Labs",
   "title": "OSS Snowflake MCP Server",
   "repository": {
-    "url": "https://github.com/krjoseph/Snowflake-Labs-mcp",
+    "url": "https://github.com/Snowflake-Labs/mcp",
     "source": "github"
   },
   "version": "${VERSION}",
