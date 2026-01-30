@@ -10,11 +10,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import hashlib
 import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Generator, Literal, Optional, Tuple, cast
 
 import yaml
@@ -53,6 +56,170 @@ tag_minor_version = 3
 query_tag = {"origin": "sf_sit", "name": "mcp_server"}
 
 logger = get_logger(server_name)
+
+# Context variable to store per-request connection parameters from headers
+request_connection_params: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "request_connection_params", default=None
+)
+
+
+class ConnectionPool:
+    """
+    Manages a pool of Snowflake connections isolated by connection parameters.
+    
+    Connections are keyed by a hash of account, user, role, warehouse, and password
+    to ensure proper isolation between different credentials.
+    """
+
+    def __init__(self):
+        self._connections: Dict[str, Any] = {}
+        self._roots: Dict[str, Any] = {}
+        self._lock = Lock()
+
+    def _get_connection_key(
+        self,
+        account: Optional[str],
+        user: Optional[str],
+        role: Optional[str],
+        warehouse: Optional[str],
+        password: Optional[str],
+        token: Optional[str] = None,
+    ) -> str:
+        """
+        Generate a unique key for connection parameters.
+        
+        Uses a hash of the connection parameters to create a unique identifier
+        for each distinct set of credentials.
+        """
+        key_parts = [
+            account or "",
+            user or "",
+            role or "",
+            warehouse or "",
+            password or "",
+            token or "",  # Include token in key for isolation
+        ]
+        key_string = "|".join(key_parts)
+        return hashlib.sha256(key_string.encode()).hexdigest()
+
+    def get_connection(
+        self,
+        connection_params: Dict[str, Any],
+        service_config_file: str,
+        is_spcs_container: bool,
+        query_tag_params: Optional[Dict[str, Any]],
+    ) -> Tuple[Any, Any]:
+        """
+        Get or create a connection from the pool based on connection parameters.
+        
+        Parameters
+        ----------
+        connection_params : dict
+            Connection parameters (account, user, role, warehouse, password, etc.)
+        service_config_file : str
+            Path to service configuration file
+        is_spcs_container : bool
+            Whether running in SPCS container
+        query_tag_params : dict, optional
+            Query tag parameters for the connection
+            
+        Returns
+        -------
+        tuple
+            A tuple containing (connection, root) objects
+        """
+        account = connection_params.get("account")
+        user = connection_params.get("user")
+        role = connection_params.get("role")
+        warehouse = connection_params.get("warehouse")
+        password = connection_params.get("password")
+        token = connection_params.get("token")
+
+        connection_key = self._get_connection_key(
+            account, user, role, warehouse, password, token
+        )
+
+        with self._lock:
+            if connection_key not in self._connections:
+                logger.info(
+                    f"Creating new connection for account={account}, user={user}, "
+                    f"role={role}, warehouse={warehouse}"
+                )
+                connection = self._create_connection(
+                    connection_params,
+                    is_spcs_container,
+                    query_tag_params,
+                )
+                root = Root(connection)
+                self._connections[connection_key] = connection
+                self._roots[connection_key] = root
+            else:
+                logger.debug(
+                    f"Reusing existing connection for account={account}, user={user}"
+                )
+
+            return self._connections[connection_key], self._roots[connection_key]
+
+    def _create_connection(
+        self,
+        connection_params: Dict[str, Any],
+        is_spcs_container: bool,
+        query_tag_params: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Create a new Snowflake connection."""
+        if is_spcs_container:
+            logger.info("Using SPCS container OAuth authentication")
+            params = {
+                "host": os.getenv("SNOWFLAKE_HOST"),
+                "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+                "token": get_spcs_container_token(),
+                "authenticator": "oauth",
+            }
+            params = {k: v for k, v in params.items() if v is not None}
+        else:
+            logger.info("Using external authentication")
+            params = connection_params.copy()
+            
+            # If token is provided, use it as password (programmatic access token)
+            # or as OAuth token if authenticator is set to oauth
+            if "token" in params and "password" not in params:
+                # Use token as password for programmatic access tokens
+                params["password"] = params.pop("token")
+
+        if not params:
+            params = {
+                "connection_name": os.getenv(
+                    "SNOWFLAKE_DEFAULT_CONNECTION_NAME", "default"
+                ),
+            }
+
+        connection = connect(
+            **params,
+            session_parameters=query_tag_params,
+            client_session_keep_alive=True,
+            paramstyle="qmark",
+        )
+
+        if connection:
+            SnowflakeService.send_initial_query(connection)
+
+        return connection
+
+    def cleanup_all(self):
+        """Close all connections in the pool."""
+        with self._lock:
+            for key, connection in self._connections.items():
+                try:
+                    logger.info(f"Closing connection {key}")
+                    connection.close()
+                except Exception as e:
+                    logger.error(f"Error closing connection {key}: {e}")
+            self._connections.clear()
+            self._roots.clear()
+
+
+# Global connection pool instance
+_connection_pool = ConnectionPool()
 
 
 class SnowflakeService:
@@ -141,9 +308,20 @@ class SnowflakeService:
         self._is_spcs_container = is_running_in_spcs_container()
 
         self.unpack_service_specs()
-        # Persist connection to avoid closing it after each request
-        self.connection = self._get_persistent_connection()
-        self.root = Root(self.connection)
+        # Store default connection params for fallback
+        self.default_connection_params = connection_params.copy()
+        # For non-HTTP transports, create default connection immediately
+        if transport not in ["http", "sse", "streamable-http"]:
+            self.connection, self.root = _connection_pool.get_connection(
+                connection_params=connection_params,
+                service_config_file=self.service_config_file,
+                is_spcs_container=self._is_spcs_container,
+                query_tag_params=self.get_query_tag_param(),
+            )
+        else:
+            # For HTTP transports, connections will be created per-request based on headers
+            self.connection = None
+            self.root = None
 
     def unpack_service_specs(self) -> None:
         """
@@ -197,6 +375,9 @@ class SnowflakeService:
         Dict[str, str]
             HTTP headers with authentication
         """
+        # Get the current connection (may be from pool based on headers)
+        connection = self._get_current_connection()
+        
         if self._is_spcs_container:
             return {
                 "Authorization": f"Bearer {get_spcs_container_token()}",
@@ -208,7 +389,7 @@ class SnowflakeService:
             return {
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
-                "Authorization": f'Snowflake Token="{self.connection.rest.token}"',
+                "Authorization": f'Snowflake Token="{connection.rest.token}"',
             }
 
     def get_api_host(self) -> str:
@@ -220,12 +401,15 @@ class SnowflakeService:
         str
             API host URL
         """
+        # Get the current connection (may be from pool based on headers)
+        connection = self._get_current_connection()
+        
         if self._is_spcs_container:
             return os.getenv(
-                "SNOWFLAKE_HOST", self.connection_params.get("account", "")
+                "SNOWFLAKE_HOST", self.default_connection_params.get("account", "")
             )
         else:
-            return self.connection.host
+            return connection.host
 
     @staticmethod
     def send_initial_query(connection: Any) -> None:
@@ -235,77 +419,46 @@ class SnowflakeService:
         with connection.cursor() as cur:
             cur.execute("SELECT 'MCP Server Snowflake'").fetchone()
 
-    def _get_persistent_connection(
-        self,
-        session_parameters: Optional[Dict[str, Any]] = None,
-    ) -> Any:
+
+    def _get_current_connection(self) -> Any:
         """
-        Get a persistent Snowflake connection.
-
-        This method creates a connection that will be kept alive and should be
-        explicitly closed when no longer needed.
-
-        Parameters
-        ----------
-        session_parameters : dict, optional
-            Additional session parameters to add to connection
-        major_version : int, optional
-            Major version of the query tag
-        minor_version : int, optional
-            Minor version of the query tag
-
+        Get the current connection, either from pool (for HTTP transports) or default.
+        
         Returns
         -------
         connection
-            A Snowflake connection object
+            The current Snowflake connection object
         """
-        try:
-            query_tag_params = self.get_query_tag_param()
-
-            if session_parameters is not None:
-                if query_tag_params:
-                    session_parameters.update(query_tag_params)
-            else:
-                session_parameters = query_tag_params
-
-            # Get connection parameters based on environment
-            if self._is_spcs_container:
-                logger.info("Using SPCS container OAuth authentication")
-                connection_params = {
-                    "host": os.getenv("SNOWFLAKE_HOST"),
-                    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-                    "token": get_spcs_container_token(),
-                    "authenticator": "oauth",
-                }
-                connection_params = {
-                    k: v for k, v in connection_params.items() if v is not None
-                }
-            else:
-                logger.info("Using external authentication")
-                connection_params = self.connection_params.copy()
-
-            # We are passing session_parameters and client_session_keep_alive
-            # so we cannot rely on the connection to infer default connection name.
-            # So instead, if no explicit values passed via CLI, we replicate the same logic here
-            if not connection_params:
-                connection_params = {
-                    "connection_name": os.getenv(
-                        "SNOWFLAKE_DEFAULT_CONNECTION_NAME", "default"
-                    ),
-                }
-
-            connection = connect(
-                **connection_params,
-                session_parameters=session_parameters,
-                client_session_keep_alive=True,
-                paramstyle="qmark",
+        # Check if we have per-request connection params from headers
+        request_params = request_connection_params.get()
+        
+        if request_params is not None:
+            # Merge header params with default params (headers take precedence)
+            merged_params = self.default_connection_params.copy()
+            merged_params.update(request_params)
+            
+            # Use connection from pool based on merged params
+            connection, root = _connection_pool.get_connection(
+                connection_params=merged_params,
+                service_config_file=self.service_config_file,
+                is_spcs_container=self._is_spcs_container,
+                query_tag_params=self.get_query_tag_param(),
             )
-            if connection:  # Send zero compute query to capture query tag
-                self.send_initial_query(connection)
-                return connection
-        except Exception as e:
-            logger.error(f"Error establishing persistent Snowflake connection: {e}")
-            raise
+            return connection
+        elif self.connection is not None:
+            # Use default connection (for non-HTTP transports)
+            return self.connection
+        else:
+            # Fallback: create connection from default params
+            connection, root = _connection_pool.get_connection(
+                connection_params=self.default_connection_params,
+                service_config_file=self.service_config_file,
+                is_spcs_container=self._is_spcs_container,
+                query_tag_params=self.get_query_tag_param(),
+            )
+            self.connection = connection
+            self.root = root
+            return connection
 
     @contextmanager
     def get_connection(
@@ -318,9 +471,7 @@ class SnowflakeService:
 
         This context manager ensures proper connection handling and cleanup.
         It automatically detects the environment and uses appropriate authentication.
-
-        If the connection is not established, it will be established with the specified parameters.
-        If the connection is already established, it will be used and session_parameters ignored.
+        For HTTP transports, connections are isolated based on runtime headers.
 
         Parameters
         ----------
@@ -342,38 +493,16 @@ class SnowflakeService:
         """
 
         try:
-            if self.connection is None:
-                # Get connection parameters based on environment
-                if self._is_spcs_container:
-                    logger.info("Using SPCS container OAuth authentication")
-                    connection_params = {
-                        "host": os.getenv("SNOWFLAKE_HOST"),
-                        "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-                        "token": get_spcs_container_token(),
-                        "authenticator": "oauth",
-                    }
-                    connection_params = {
-                        k: v for k, v in connection_params.items() if v is not None
-                    }
-                else:
-                    logger.info("Using external authentication")
-                    connection_params = self.connection_params.copy()
-
-                self.connection = connect(
-                    **connection_params,
-                    session_parameters=session_parameters,
-                    client_session_keep_alive=False,
-                    paramstyle="qmark",
-                )
+            connection = self._get_current_connection()
 
             cursor = (
-                self.connection.cursor(DictCursor)
+                connection.cursor(DictCursor)
                 if use_dict_cursor
-                else self.connection.cursor()
+                else connection.cursor()
             )
 
             try:
-                yield self.connection, cursor
+                yield connection, cursor
             finally:
                 cursor.close()
 
@@ -622,6 +751,96 @@ def main():
 
     # Create server with lifespan that has access to args
     server = FastMCP("Snowflake MCP Server", lifespan=create_lifespan(args))
+
+    # Add HTTP middleware for header extraction if using HTTP transport
+    if args.transport and args.transport in ["http", "sse", "streamable-http"]:
+        try:
+            from starlette.middleware.base import BaseHTTPMiddleware
+            from starlette.requests import Request
+            
+            class HeaderExtractionMiddleware(BaseHTTPMiddleware):
+                """HTTP middleware to extract connection parameters from headers."""
+                
+                async def dispatch(self, request: Request, call_next):
+                    """Extract headers and store in context variable."""
+                    headers = request.headers
+                    
+                    # Extract connection parameters from headers
+                    # Support both x-snowflake-* and SNOWFLAKE_* header formats
+                    account = (
+                        headers.get("x-snowflake-account") 
+                        or headers.get("X-Snowflake-Account")
+                        or headers.get("SNOWFLAKE_ACCOUNT")
+                    )
+                    user = (
+                        headers.get("x-snowflake-user")
+                        or headers.get("X-Snowflake-User")
+                        or headers.get("SNOWFLAKE_USER")
+                    )
+                    role = (
+                        headers.get("x-snowflake-role")
+                        or headers.get("X-Snowflake-Role")
+                        or headers.get("SNOWFLAKE_ROLE")
+                    )
+                    warehouse = (
+                        headers.get("x-snowflake-warehouse")
+                        or headers.get("X-Snowflake-Warehouse")
+                        or headers.get("SNOWFLAKE_WAREHOUSE")
+                    )
+                    
+                    # Extract token from Authorization Bearer header
+                    token = None
+                    auth_header = headers.get("authorization") or headers.get("Authorization")
+                    if auth_header:
+                        # Support "Bearer <token>" format
+                        if auth_header.startswith("Bearer ") or auth_header.startswith("bearer "):
+                            token = auth_header.split(" ", 1)[1] if " " in auth_header else None
+                    
+                    # Fallback to X-Snowflake-Password header for backward compatibility
+                    password = (
+                        headers.get("x-snowflake-password")
+                        or headers.get("X-Snowflake-Password")
+                        or headers.get("SNOWFLAKE_PASSWORD")
+                    )
+                    
+                    # Only set if at least one header is provided
+                    if any([account, user, role, warehouse, password, token]):
+                        connection_params = {}
+                        if account:
+                            connection_params["account"] = account
+                        if user:
+                            connection_params["user"] = user
+                        if role:
+                            connection_params["role"] = role
+                        if warehouse:
+                            connection_params["warehouse"] = warehouse
+                        if token:
+                            # Use token (will be converted to password in _create_connection)
+                            connection_params["token"] = token
+                        elif password:
+                            connection_params["password"] = password
+                        
+                        # Set in context for this request
+                        request_connection_params.set(connection_params)
+                    
+                    try:
+                        response = await call_next(request)
+                        return response
+                    finally:
+                        # Clear the context after request completes
+                        request_connection_params.set(None)
+            
+            # Add HTTP middleware to the FastMCP server's underlying app
+            if hasattr(server, "app"):
+                server.app.add_middleware(HeaderExtractionMiddleware)
+            elif hasattr(server, "_app"):
+                server._app.add_middleware(HeaderExtractionMiddleware)
+            else:
+                logger.warning("Could not access FastMCP app to add HTTP middleware. Header extraction may not work.")
+        except ImportError:
+            logger.warning("Starlette not available. HTTP header extraction may not work.")
+        except Exception as e:
+            logger.warning(f"Could not add HTTP middleware: {e}")
 
     try:
         logger.info("Starting Snowflake MCP Server...")

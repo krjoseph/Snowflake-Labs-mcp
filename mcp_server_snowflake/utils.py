@@ -495,9 +495,17 @@ def cleanup_snowflake_service(snowflake_service):
         return
 
     try:
+        # Clean up connection pool (closes all connections)
+        from mcp_server_snowflake.server import _connection_pool
+        _connection_pool.cleanup_all()
+        
+        # Also close default connection if it exists
         if hasattr(snowflake_service, "connection") and snowflake_service.connection:
-            logger.info("Closing Snowflake connection...")
-            snowflake_service.connection.close()
+            try:
+                logger.info("Closing default Snowflake connection...")
+                snowflake_service.connection.close()
+            except Exception:
+                pass  # Connection might already be closed by pool
     except Exception as e:
         logger.error(f"Error closing Snowflake connection: {e}")
 
