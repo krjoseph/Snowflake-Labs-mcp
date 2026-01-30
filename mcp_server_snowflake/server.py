@@ -186,12 +186,19 @@ class ConnectionPool:
                 # Use token as password for programmatic access tokens
                 params["password"] = params.pop("token")
 
+        # Only fall back to connection_name if we have no params AND connection_name is explicitly provided
+        # For HTTP transports, we require connection params via headers or env vars
         if not params:
-            params = {
-                "connection_name": os.getenv(
-                    "SNOWFLAKE_DEFAULT_CONNECTION_NAME", "default"
-                ),
-            }
+            connection_name = os.getenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME")
+            if connection_name:
+                params = {"connection_name": connection_name}
+            else:
+                # For HTTP transports, require connection params - don't use default connection_name
+                raise ValueError(
+                    "No connection parameters provided. For HTTP transports, provide connection "
+                    "parameters via headers (X-Snowflake-Account, X-Snowflake-User, etc.) or "
+                    "environment variables (SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, etc.)."
+                )
 
         connection = connect(
             **params,
@@ -428,6 +435,11 @@ class SnowflakeService:
         -------
         connection
             The current Snowflake connection object
+            
+        Raises
+        ------
+        ValueError
+            If no connection parameters are available and connection cannot be created
         """
         # Check if we have per-request connection params from headers
         request_params = request_connection_params.get()
@@ -448,8 +460,17 @@ class SnowflakeService:
         elif self.connection is not None:
             # Use default connection (for non-HTTP transports)
             return self.connection
+        elif self.transport in ["http", "sse", "streamable-http"]:
+            # For HTTP transports, require connection params via headers
+            # Don't create a connection without params
+            raise ValueError(
+                "No connection parameters provided in request headers. "
+                "Please provide X-Snowflake-Account, X-Snowflake-User, X-Snowflake-Role, "
+                "X-Snowflake-Warehouse, and Authorization Bearer token headers."
+            )
         else:
-            # Fallback: create connection from default params
+            # For non-HTTP transports, try to create connection from default params
+            # This will raise an error if params are missing
             connection, root = _connection_pool.get_connection(
                 connection_params=self.default_connection_params,
                 service_config_file=self.service_config_file,
