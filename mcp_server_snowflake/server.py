@@ -126,12 +126,21 @@ class ConnectionPool:
         tuple
             A tuple containing (connection, root) objects
         """
-        account = connection_params.get("account")
-        user = connection_params.get("user")
-        role = connection_params.get("role")
-        warehouse = connection_params.get("warehouse")
-        password = connection_params.get("password")
-        token = connection_params.get("token")
+        
+        # Filter out None/empty account and user before processing
+        # Make a copy to avoid modifying the original dict
+        filtered_params = connection_params.copy()
+        if "account" in filtered_params and (filtered_params["account"] is None or filtered_params["account"] == ""):
+            filtered_params.pop("account", None)
+        if "user" in filtered_params and (filtered_params["user"] is None or filtered_params["user"] == ""):
+            filtered_params.pop("user", None)
+        
+        account = filtered_params.get("account")
+        user = filtered_params.get("user")
+        role = filtered_params.get("role")
+        warehouse = filtered_params.get("warehouse")
+        password = filtered_params.get("password")
+        token = filtered_params.get("token")
 
         connection_key = self._get_connection_key(
             account, user, role, warehouse, password, token
@@ -139,12 +148,8 @@ class ConnectionPool:
 
         with self._lock:
             if connection_key not in self._connections:
-                logger.info(
-                    f"Creating new connection for account={account}, user={user}, "
-                    f"role={role}, warehouse={warehouse}"
-                )
                 connection = self._create_connection(
-                    connection_params,
+                    filtered_params,
                     is_spcs_container,
                     query_tag_params,
                 )
@@ -152,9 +157,14 @@ class ConnectionPool:
                 self._connections[connection_key] = connection
                 self._roots[connection_key] = root
             else:
-                logger.debug(
-                    f"Reusing existing connection for account={account}, user={user}"
-                )
+                # Log connection reuse without account/user (they're optional)
+                log_parts = []
+                if role:
+                    log_parts.append(f"role={role}")
+                if warehouse:
+                    log_parts.append(f"warehouse={warehouse}")
+                if log_parts:
+                    logger.info(f"Reusing existing Snowflake connection for {', '.join(log_parts)}")
 
             return self._connections[connection_key], self._roots[connection_key]
 
@@ -166,7 +176,6 @@ class ConnectionPool:
     ) -> Any:
         """Create a new Snowflake connection."""
         if is_spcs_container:
-            logger.info("Using SPCS container OAuth authentication")
             params = {
                 "host": os.getenv("SNOWFLAKE_HOST"),
                 "account": os.getenv("SNOWFLAKE_ACCOUNT"),
@@ -175,27 +184,59 @@ class ConnectionPool:
             }
             params = {k: v for k, v in params.items() if v is not None}
         else:
-            logger.info("Using external authentication")
             params = connection_params.copy()
+            
+            # Only include account and user if they are set (not None or empty)
+            # Remove them if they're None or empty to make them optional
+            if "account" in params and (params["account"] is None or params["account"] == ""):
+                params.pop("account", None)
+            if "user" in params and (params["user"] is None or params["user"] == ""):
+                params.pop("user", None)
             
             # If token is provided, use it as password (programmatic access token)
             # or as OAuth token if authenticator is set to oauth
+            # When using tokens, account and user are optional - Snowflake extracts them from the token
             if "token" in params and "password" not in params:
                 # Use token as password for programmatic access tokens
                 params["password"] = params.pop("token")
+            
+            # Check if we have authentication credentials (token/password)
+            has_token_or_password = ("password" in params and params["password"]) or ("token" in params and params["token"])
+            has_account = "account" in params and params["account"]
+            has_user = "user" in params and params["user"]
+            
+            # If we have a token/password, account and user are optional (Snowflake extracts from token)
+            # If we don't have token/password, we need account and user (or connection_name)
+            if not has_token_or_password and (not has_account or not has_user):
+                # No token/password and missing account/user - try connection_name
+                connection_name = os.getenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME")
+                if connection_name:
+                    # Use connection_name with any additional params (role, warehouse)
+                    params = {"connection_name": connection_name}
+                    # Add role and warehouse if they were provided in connection_params
+                    if "role" in connection_params and connection_params["role"]:
+                        params["role"] = connection_params["role"]
+                    if "warehouse" in connection_params and connection_params["warehouse"]:
+                        params["warehouse"] = connection_params["warehouse"]
+                else:
+                    # No token/password, no account/user, and no connection_name - can't connect
+                    raise ValueError(
+                        "Authentication credentials required. Provide SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER "
+                        "with SNOWFLAKE_PASSWORD, or provide an Authorization Bearer token (account/user extracted "
+                        "from token), or set SNOWFLAKE_DEFAULT_CONNECTION_NAME. Optional headers: "
+                        "X-Snowflake-Role, X-Snowflake-Warehouse."
+                    )
 
-        # Only fall back to connection_name if we have no params AND connection_name is explicitly provided
-        # For HTTP transports, we require connection params via headers or env vars
+        # Fallback: if params is empty, try connection_name
         if not params:
             connection_name = os.getenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME")
             if connection_name:
                 params = {"connection_name": connection_name}
             else:
-                # For HTTP transports, require connection params - don't use default connection_name
                 raise ValueError(
-                    "No connection parameters provided. For HTTP transports, provide connection "
-                    "parameters via headers (X-Snowflake-Account, X-Snowflake-User, etc.) or "
-                    "environment variables (SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, etc.)."
+                    "No connection parameters provided. Provide connection parameters via environment "
+                    "variables or use SNOWFLAKE_DEFAULT_CONNECTION_NAME. Optional headers: "
+                    "X-Snowflake-Role, X-Snowflake-Warehouse."
                 )
 
         connection = connect(
@@ -447,6 +488,13 @@ class SnowflakeService:
             merged_params = self.default_connection_params.copy()
             merged_params.update(request_params)
             
+            # Account and user are optional - only include if they are set (not None or empty)
+            # Remove them if they're None or empty to make them optional
+            if "account" in merged_params and (merged_params["account"] is None or merged_params["account"] == ""):
+                merged_params.pop("account", None)
+            if "user" in merged_params and (merged_params["user"] is None or merged_params["user"] == ""):
+                merged_params.pop("user", None)
+            
             # Use connection from pool based on merged params
             connection, root = _connection_pool.get_connection(
                 connection_params=merged_params,
@@ -459,13 +507,22 @@ class SnowflakeService:
             # Use default connection (for non-HTTP transports)
             return self.connection
         elif self.transport in ["http", "sse", "streamable-http"]:
-            # For HTTP transports, require connection params via headers
-            # Don't create a connection without params
-            raise ValueError(
-                "No connection parameters provided in request headers. "
-                "Please provide X-Snowflake-Account, X-Snowflake-User, X-Snowflake-Role, "
-                "X-Snowflake-Warehouse, and Authorization Bearer token headers."
-            )
+            # For HTTP transports, try to use connection_name from env if no other params
+            connection_name = os.getenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME")
+            if connection_name:
+                connection, root = _connection_pool.get_connection(
+                    connection_params={"connection_name": connection_name},
+                    service_config_file=self.service_config_file,
+                    is_spcs_container=self._is_spcs_container,
+                    query_tag_params=self.get_query_tag_param(),
+                )
+                return connection
+            else:
+                raise ValueError(
+                    "No connection parameters provided. Provide connection parameters via environment "
+                    "variables or use SNOWFLAKE_DEFAULT_CONNECTION_NAME. Optional headers: "
+                    "X-Snowflake-Role, X-Snowflake-Warehouse."
+                )
         else:
             # For non-HTTP transports, try to create connection from default params
             # This will raise an error if params are missing
@@ -677,6 +734,12 @@ def create_lifespan(args):
             for key in get_login_params().keys()
             if getattr(args, key) is not None
         }
+        # Account and user are optional - only include if explicitly set from env/cli
+        # Remove None or empty string values for account and user to make them truly optional
+        if "account" in connection_params and (connection_params["account"] is None or connection_params["account"] == ""):
+            connection_params.pop("account", None)
+        if "user" in connection_params and (connection_params["user"] is None or connection_params["user"] == ""):
+            connection_params.pop("user", None)
         service_config_file = get_var(
             "service_config_file", "SERVICE_CONFIG_FILE", args
         )
@@ -769,97 +832,9 @@ def main():
     warn_deprecated_params()
 
     # Create server with lifespan that has access to args
+    # Note: HTTP middleware for header extraction is handled by HeaderConnectionMiddleware
+    # in server_utils.py, which is initialized via initialize_middleware() in the lifespan function
     server = FastMCP("Snowflake MCP Server", lifespan=create_lifespan(args))
-
-    # Add HTTP middleware for header extraction if using HTTP transport
-    if args.transport and args.transport in ["http", "sse", "streamable-http"]:
-        try:
-            from starlette.middleware.base import BaseHTTPMiddleware
-            from starlette.requests import Request
-            
-            class HeaderExtractionMiddleware(BaseHTTPMiddleware):
-                """HTTP middleware to extract connection parameters from headers."""
-                
-                async def dispatch(self, request: Request, call_next):
-                    """Extract headers and store in context variable."""
-                    headers = request.headers
-                    
-                    # Extract connection parameters from headers
-                    # Support both x-snowflake-* and SNOWFLAKE_* header formats
-                    account = (
-                        headers.get("x-snowflake-account") 
-                        or headers.get("X-Snowflake-Account")
-                        or headers.get("SNOWFLAKE_ACCOUNT")
-                    )
-                    user = (
-                        headers.get("x-snowflake-user")
-                        or headers.get("X-Snowflake-User")
-                        or headers.get("SNOWFLAKE_USER")
-                    )
-                    role = (
-                        headers.get("x-snowflake-role")
-                        or headers.get("X-Snowflake-Role")
-                        or headers.get("SNOWFLAKE_ROLE")
-                    )
-                    warehouse = (
-                        headers.get("x-snowflake-warehouse")
-                        or headers.get("X-Snowflake-Warehouse")
-                        or headers.get("SNOWFLAKE_WAREHOUSE")
-                    )
-                    
-                    # Extract token from Authorization Bearer header
-                    token = None
-                    auth_header = headers.get("authorization") or headers.get("Authorization")
-                    if auth_header:
-                        # Support "Bearer <token>" format
-                        if auth_header.startswith("Bearer ") or auth_header.startswith("bearer "):
-                            token = auth_header.split(" ", 1)[1] if " " in auth_header else None
-                    
-                    # Fallback to X-Snowflake-Password header for backward compatibility
-                    password = (
-                        headers.get("x-snowflake-password")
-                        or headers.get("X-Snowflake-Password")
-                        or headers.get("SNOWFLAKE_PASSWORD")
-                    )
-                    
-                    # Only set if at least one header is provided
-                    if any([account, user, role, warehouse, password, token]):
-                        connection_params = {}
-                        if account:
-                            connection_params["account"] = account
-                        if user:
-                            connection_params["user"] = user
-                        if role:
-                            connection_params["role"] = role
-                        if warehouse:
-                            connection_params["warehouse"] = warehouse
-                        if token:
-                            # Use token (will be converted to password in _create_connection)
-                            connection_params["token"] = token
-                        elif password:
-                            connection_params["password"] = password
-                        
-                        # Set in context for this request
-                        request_connection_params.set(connection_params)
-                    
-                    try:
-                        response = await call_next(request)
-                        return response
-                    finally:
-                        # Clear the context after request completes
-                        request_connection_params.set(None)
-            
-            # Add HTTP middleware to the FastMCP server's underlying app
-            if hasattr(server, "app"):
-                server.app.add_middleware(HeaderExtractionMiddleware)
-            elif hasattr(server, "_app"):
-                server._app.add_middleware(HeaderExtractionMiddleware)
-            else:
-                logger.warning("Could not access FastMCP app to add HTTP middleware. Header extraction may not work.")
-        except ImportError:
-            logger.warning("Starlette not available. HTTP header extraction may not work.")
-        except Exception as e:
-            logger.warning(f"Could not add HTTP middleware: {e}")
 
     try:
         logger.info("Starting Snowflake MCP Server...")

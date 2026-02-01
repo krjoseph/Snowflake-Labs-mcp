@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.utilities.logging import get_logger
 
 from mcp_server_snowflake.object_manager.tools import validate_object_tool
 from mcp_server_snowflake.query_manager.tools import validate_sql_type
@@ -13,6 +14,8 @@ try:
     STARLETTE_AVAILABLE = True
 except ImportError:
     STARLETTE_AVAILABLE = False
+
+logger = get_logger(__name__)
 
 # Context variable to store per-request connection parameters from headers
 # Defined here to avoid circular import with server.py
@@ -27,8 +30,99 @@ class HeaderConnectionMiddleware(Middleware):
     def __init__(self, transport: str):
         self.transport = transport
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Extract connection parameters from headers if using HTTP transport."""
+    def _extract_headers(self):
+        """Extract HTTP headers using FastMCP's dependency injection."""
+        headers = {}
+        
+        # Use FastMCP's dependency injection to get HTTP headers
+        # Use include_all=True to get ALL headers including custom X-Snowflake-* headers
+        try:
+            from fastmcp.server.dependencies import get_http_headers, get_http_request
+            headers = get_http_headers(include_all=True) or {}
+            
+            # Also try to get the raw request object
+            try:
+                request = get_http_request()
+                if request:
+                    raw_headers = dict(request.headers)
+                    # Merge raw headers (they might have more headers)
+                    headers.update(raw_headers)
+            except Exception:
+                pass
+        except (ImportError, Exception):
+            pass
+        
+        # Also try to get from Starlette's request scope as fallback/additional source
+        if STARLETTE_AVAILABLE:
+            try:
+                from contextvars import copy_context
+                ctx = copy_context()
+                # Look for Request in context
+                for var in ctx:
+                    if isinstance(var, Request):
+                        starlette_headers = dict(var.headers)
+                        # Merge Starlette headers (they might have more headers)
+                        if starlette_headers:
+                            # Starlette headers might have more complete set
+                            headers.update(starlette_headers)
+                        break
+            except Exception:
+                pass
+        
+        return headers
+
+    def _extract_connection_params(self, headers):
+        """Extract connection parameters from headers."""
+        # Extract connection parameters from headers (case-insensitive)
+        # Normalize headers to lowercase for matching
+        headers_lower = {k.lower(): v for k, v in headers.items()}
+        
+        # Extract role and warehouse from headers (optional)
+        role = (
+            headers_lower.get("x-snowflake-role")
+            or headers_lower.get("snowflake-role")
+            or headers_lower.get("snowflake_role")
+        )
+        warehouse = (
+            headers_lower.get("x-snowflake-warehouse")
+            or headers_lower.get("snowflake-warehouse")
+            or headers_lower.get("snowflake_warehouse")
+        )
+        
+        # Extract token from Authorization Bearer header (case-insensitive)
+        token = None
+        auth_header = headers_lower.get("authorization")
+        if auth_header:
+            # Support "Bearer <token>" format (case-insensitive)
+            auth_header_lower = auth_header.lower()
+            if auth_header_lower.startswith("bearer "):
+                token = auth_header.split(" ", 1)[1] if " " in auth_header else None
+        
+        # Fallback to X-Snowflake-Password header for backward compatibility (case-insensitive)
+        password = (
+            headers_lower.get("x-snowflake-password") 
+            or headers_lower.get("snowflake-password")
+            or headers_lower.get("snowflake_password")
+        )
+        
+        # Only set if at least one header is provided
+        if any([role, warehouse, password, token]):
+            connection_params = {}
+            if role:
+                connection_params["role"] = role
+            if warehouse:
+                connection_params["warehouse"] = warehouse
+            if token:
+                # Use token (will be converted to password in _create_connection)
+                connection_params["token"] = token
+            elif password:
+                connection_params["password"] = password
+            
+            return connection_params
+        return None
+
+    async def on_request(self, context: MiddlewareContext, call_next):
+        """Extract connection parameters from headers at request level (runs before tool calls)."""
         # Only process headers for HTTP transports
         if self.transport not in ["http", "sse", "streamable-http"]:
             return await call_next(context)
@@ -36,81 +130,18 @@ class HeaderConnectionMiddleware(Middleware):
         connection_params = None
         
         try:
-            headers = {}
-            
-            # Try multiple ways to access the HTTP request
-            # Method 1: Check if context has request attribute
-            if hasattr(context, "request"):
-                request = context.request
-                if hasattr(request, "headers"):
-                    headers = request.headers
-            # Method 2: Try to get from Starlette's request scope
-            elif STARLETTE_AVAILABLE:
-                try:
-                    # Try to access request from contextvars (Starlette pattern)
-                    from contextvars import copy_context
-                    ctx = copy_context()
-                    # Look for Request in context
-                    for var in ctx:
-                        if isinstance(var, Request):
-                            headers = var.headers
-                            break
-                except Exception:
-                    pass
+            # Try multiple methods to get headers
+            headers = self._extract_headers()
             
             # Extract connection parameters from headers
-            # Support both x-snowflake-* and snowflake-* header formats
-            account = headers.get("x-snowflake-account") or headers.get("snowflake-account") or headers.get("X-Snowflake-Account")
-            user = headers.get("x-snowflake-user") or headers.get("snowflake-user") or headers.get("X-Snowflake-User")
-            role = headers.get("x-snowflake-role") or headers.get("snowflake-role") or headers.get("X-Snowflake-Role")
-            warehouse = headers.get("x-snowflake-warehouse") or headers.get("snowflake-warehouse") or headers.get("X-Snowflake-Warehouse")
+            connection_params = self._extract_connection_params(headers)
             
-            # Extract token from Authorization Bearer header
-            token = None
-            auth_header = headers.get("authorization") or headers.get("Authorization")
-            if auth_header:
-                # Support "Bearer <token>" format
-                if auth_header.startswith("Bearer ") or auth_header.startswith("bearer "):
-                    token = auth_header.split(" ", 1)[1] if " " in auth_header else None
-            
-            # Fallback to X-Snowflake-Password header for backward compatibility
-            password = headers.get("x-snowflake-password") or headers.get("snowflake-password") or headers.get("X-Snowflake-Password")
-            
-            # Also check environment variable names as headers (for compatibility)
-            if not account:
-                account = headers.get("SNOWFLAKE_ACCOUNT")
-            if not user:
-                user = headers.get("SNOWFLAKE_USER")
-            if not role:
-                role = headers.get("SNOWFLAKE_ROLE")
-            if not warehouse:
-                warehouse = headers.get("SNOWFLAKE_WAREHOUSE")
-            if not password and not token:
-                password = headers.get("SNOWFLAKE_PASSWORD")
-            
-            # Only set if at least one header is provided
-            if any([account, user, role, warehouse, password, token]):
-                connection_params = {}
-                if account:
-                    connection_params["account"] = account
-                if user:
-                    connection_params["user"] = user
-                if role:
-                    connection_params["role"] = role
-                if warehouse:
-                    connection_params["warehouse"] = warehouse
-                if token:
-                    # Use token (will be converted to password in _create_connection)
-                    connection_params["token"] = token
-                elif password:
-                    connection_params["password"] = password
-                    
+            if connection_params:
                 # Set in context for this request
                 request_connection_params.set(connection_params)
-        except Exception as e:
+        except Exception:
             # If header extraction fails, continue with default connection
-            import logging
-            logging.getLogger(__name__).debug(f"Could not extract headers: {e}")
+            pass
 
         try:
             return await call_next(context)
