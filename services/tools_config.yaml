@@ -11,20 +11,20 @@ other_services:
   semantic_manager: true
 
 sql_statement_permissions:
-  - Alter: true
-  - Command: true
+  - Alter: false
+  - Command: false
   - Comment: true
-  - Commit: true
-  - Create: true
-  - Delete: true
+  - Commit: false
+  - Create: false
+  - Delete: false
   - Describe: true
-  - Drop: true
-  - Insert: true
-  - Merge: true
-  - Rollback: true
+  - Drop: false
+  - Insert: false
+  - Merge: false
+  - Rollback: false
   - Select: true
-  - Transaction: true
-  - TruncateTable: true
+  - Transaction: false
+  - TruncateTable: false
   - Unknown: false
-  - Update: true
+  - Update: false
   - Use: true

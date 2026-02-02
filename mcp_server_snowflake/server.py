@@ -948,13 +948,11 @@ def initialize_tools(snowflake_service: SnowflakeService, server: FastMCP):
         if snowflake_service.semantic_manager:
             initialize_semantic_manager_tools(server, snowflake_service)
 
-        # Add tool for agent service
-        if snowflake_service.agent_services:
-            initialize_cortex_agent_tool(server, snowflake_service)
+        # Add tools for agent service (always available for dynamic discovery)
+        initialize_cortex_agent_tool(server, snowflake_service)
 
-        # Add tool for search service
-        if snowflake_service.search_services:
-            initialize_cortex_search_tool(server, snowflake_service)
+        # Add tools for search service (always available for dynamic discovery)
+        initialize_cortex_search_tool(server, snowflake_service)
 
         if snowflake_service.analyst_services:
             initialize_cortex_analyst_tool(server, snowflake_service)
