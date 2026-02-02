@@ -844,12 +844,14 @@ def parse_arguments():
         default="0.0.0.0",
     )
     # These left as simply port and endpoint for backward compatibility with existing deployments
+    # Check PORT env var for Heroku compatibility (Heroku sets PORT env var)
+    default_port = int(os.environ.get("PORT", 9000))
     parser.add_argument(
         "--port",
         required=False,
         type=int,
-        help="Port number for the server to listen on (default: 9000)",
-        default=9000,
+        help="Port number for the server to listen on (default: 9000, or PORT env var if set)",
+        default=default_port,
     )
     parser.add_argument(
         "--endpoint",
@@ -988,9 +990,10 @@ def main():
             "streamable-http",
         ]:
             host = os.environ.get("SNOWFLAKE_MCP_HOST", args.server_host)
-            port = int(os.environ.get("SNOWFLAKE_MCP_PORT", str(args.port)))
+            # Check PORT env var for Heroku compatibility, then SNOWFLAKE_MCP_PORT, then args.port
+            port = int(os.environ.get("PORT") or os.environ.get("SNOWFLAKE_MCP_PORT") or str(args.port))
             endpoint = os.environ.get("SNOWFLAKE_MCP_ENDPOINT", args.endpoint)
-            logger.info(f"Starting server with transport: {args.transport}")
+            logger.info(f"Starting server with transport: {args.transport} on port {port}")
             server.run(transport=args.transport, host=host, port=port, path=endpoint)
         else:
             logger.info(f"Starting server with transport: {args.transport or 'stdio'}")
