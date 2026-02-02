@@ -1,7 +1,8 @@
 import json
-from typing import Annotated, Any, Literal, Union, get_args
+from typing import Annotated, Any, Literal, Optional, Union, get_args
 
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 from snowflake.core import CreateMode, Root
 
@@ -98,6 +99,7 @@ def list_objects(
     schema_name: str = None,
     like: str = None,
     starts_with: str = None,
+    headers: dict = None,
 ):
     bindvars = []
     if object_type == "image_repository":
@@ -140,7 +142,7 @@ def list_objects(
         statement += f" STARTS WITH '{sanitized_starts_with}'"
 
     try:
-        result = execute_query(statement, snowflake_service, bindvars)
+        result = execute_query(statement, snowflake_service, bindvars, headers=headers)
 
         if len(result) > 0:
             return result[0:1000]  # Limit to 1000 results
@@ -189,8 +191,17 @@ def parse_object(target_object: Any, obj_type: supported_objects):
 
 
 def initialize_object_manager_tools(server: FastMCP, snowflake_service):
-    root = snowflake_service.root
     supported_objects_list = list(get_args(supported_objects))
+    
+    def get_root(headers: dict = None):
+        """Get Root object, using headers for multi-tenant mode."""
+        if snowflake_service.transport == "streamable-http" and headers:
+            try:
+                _, _, root = snowflake_service.get_connection_from_headers(headers)
+                return root
+            except Exception:
+                pass
+        return snowflake_service.root
     object_type_annotation = Annotated[
         supported_objects,
         Field(
@@ -218,9 +229,23 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
         mode: Literal[
             "error_if_exists", "replace", "if_not_exists"
         ] = "error_if_exists",
+        http_headers: Optional[dict] = None,
     ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                # Try to get headers from HTTP request directly
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    # Fallback to get_http_headers()
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
         # If string is passed, parse JSON and create object
         target_object = parse_object(target_object, object_type)
+        root = get_root(http_headers)
         return create_object(target_object, root, mode)
 
     @server.tool(
@@ -231,8 +256,22 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
         object_type: object_type_annotation,
         target_object: target_object_annotation,
         if_exists: bool = False,
+        http_headers: Optional[dict] = None,
     ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                # Try to get headers from HTTP request directly
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    # Fallback to get_http_headers()
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
         target_object = parse_object(target_object, object_type)
+        root = get_root(http_headers)
         return drop_object(target_object, root, if_exists)
 
     @server.tool(
@@ -242,8 +281,22 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     def create_or_alter_object_tool(
         object_type: object_type_annotation,
         target_object: target_object_annotation,
+        http_headers: Optional[dict] = None,
     ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                # Try to get headers from HTTP request directly
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    # Fallback to get_http_headers()
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
         target_object = parse_object(target_object, object_type)
+        root = get_root(http_headers)
         return create_or_alter_object(target_object, root)
 
     @server.tool(
@@ -253,8 +306,22 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     def describe_object_tool(
         object_type: object_type_annotation,
         target_object: target_object_annotation,
+        http_headers: Optional[dict] = None,
     ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                # Try to get headers from HTTP request directly
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    # Fallback to get_http_headers()
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
         target_object = parse_object(target_object, object_type)
+        root = get_root(http_headers)
         return describe_object(target_object, root)
 
     @server.tool(
@@ -279,7 +346,20 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
                 default=None,
             ),
         ] = None,
+        http_headers: Optional[dict] = None,
     ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                # Try to get headers from HTTP request directly
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    # Fallback to get_http_headers()
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
         return list_objects(
             snowflake_service,
             object_type,
@@ -287,6 +367,7 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
             schema_name,
             like,
             starts_with,
+            headers=http_headers,
         )
 
 

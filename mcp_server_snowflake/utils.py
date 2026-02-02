@@ -55,11 +55,12 @@ def warn_deprecated_params() -> None:
         logger.info(f"Deprecated parameters: {', '.join(deprecated_found)}")
 
 
-def execute_query(statement: str, snowflake_service, bindvars: list[str] = []):
+def execute_query(statement: str, snowflake_service, bindvars: list[str] = [], headers: dict = None):
     """Execute a Snowflake query and return the results using Python connector dictionary cursor."""
     with snowflake_service.get_connection(
         use_dict_cursor=True,
         session_parameters=snowflake_service.get_query_tag_param(),
+        headers=headers,
     ) as (
         con,
         cur,
@@ -180,7 +181,7 @@ class SnowflakeResponse:
         Decorator factory for response parsing
     """
 
-    def fetch_results(self, statement: str, service, **kwargs):
+    def fetch_results(self, statement: str, service, headers: dict = None, **kwargs):
         """
         Execute SQL statement and fetch all results using Snowflake connector.
 
@@ -193,6 +194,8 @@ class SnowflakeResponse:
             SQL statement to execute
         service : SnowflakeService
             The Snowflake service instance to use for connection
+        headers : dict, optional
+            HTTP request headers (for multi-tenant mode)
         **kwargs
             Additional connection parameters (e.g., role, warehouse)
 
@@ -208,7 +211,9 @@ class SnowflakeResponse:
         """
         # Forward any remaining kwargs to get_connection
         with service.get_connection(
-            use_dict_cursor=True, session_parameters=service.get_query_tag_param()
+            use_dict_cursor=True, 
+            session_parameters=service.get_query_tag_param(),
+            headers=headers
         ) as (
             con,
             cur,
@@ -217,7 +222,7 @@ class SnowflakeResponse:
             return cur.fetchall()
 
     def parse_analyst_response(
-        self, response: requests.Response | dict, service, **kwargs
+        self, response: requests.Response | dict, service, headers: dict = None, **kwargs
     ) -> str:
         """
         Parse Cortex Analyst API response and execute any generated SQL.
@@ -232,6 +237,8 @@ class SnowflakeResponse:
             Raw response from Cortex Analyst API
         service : SnowflakeService
             The Snowflake service instance to use for connection
+        headers : dict, optional
+            HTTP request headers (for multi-tenant mode)
         **kwargs
             Additional connection parameters for SQL execution
 
@@ -250,7 +257,7 @@ class SnowflakeResponse:
                 res["sql"] = item.get("statement", "")
                 if item.get("statement"):
                     res["results"] = self.fetch_results(
-                        statement=res["sql"], service=service, **kwargs
+                        statement=res["sql"], service=service, headers=headers, **kwargs
                     )
         response = AnalystResponse(**res)
         return response.model_dump_json()
@@ -369,10 +376,11 @@ class SnowflakeResponse:
             async def response_parsers(*args: P.args, **kwargs: P.kwargs) -> R:
                 raw_sse = await func(*args, **kwargs)
                 snowflake_service = kwargs.get("snowflake_service")
+                http_headers = kwargs.get("http_headers")
                 match api:
                     case "analyst":
                         parsed = self.parse_analyst_response(
-                            response=raw_sse, service=snowflake_service
+                            response=raw_sse, service=snowflake_service, headers=http_headers
                         )
                     case "search":
                         parsed = self.parse_search_response(response=raw_sse)
@@ -495,6 +503,12 @@ def cleanup_snowflake_service(snowflake_service):
         return
 
     try:
+        # Close connection pool if it exists (multi-tenant mode)
+        if hasattr(snowflake_service, "_connection_pool") and snowflake_service._connection_pool:
+            logger.info("Closing connection pool...")
+            snowflake_service._connection_pool.close_all()
+        
+        # Close persistent connection if it exists (single-tenant mode)
         if hasattr(snowflake_service, "connection") and snowflake_service.connection:
             logger.info("Closing Snowflake connection...")
             snowflake_service.connection.close()

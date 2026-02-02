@@ -1,14 +1,15 @@
-from typing import Annotated
+from typing import Annotated, Optional
 
 import sqlglot
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 
 from mcp_server_snowflake.query_manager.prompts import query_tool_prompt
 from mcp_server_snowflake.utils import SnowflakeException
 
 
-def run_query(statement: str, snowflake_service):
+def run_query(statement: str, snowflake_service, headers: dict = None):
     """
     Execute SQL statement and fetch all results using Snowflake connector.
 
@@ -21,6 +22,8 @@ def run_query(statement: str, snowflake_service):
         SQL statement to execute
     snowflake_service : SnowflakeService
         The Snowflake service instance to use for connection
+    headers : dict, optional
+        HTTP request headers (for multi-tenant mode)
 
     Returns
     -------
@@ -36,6 +39,7 @@ def run_query(statement: str, snowflake_service):
         with snowflake_service.get_connection(
             use_dict_cursor=True,
             session_parameters=snowflake_service.get_query_tag_param(),
+            headers=headers,
         ) as (
             con,
             cur,
@@ -60,8 +64,21 @@ def initialize_query_manager_tool(server: FastMCP, snowflake_service):
             str,
             Field(description="SQL query to execute"),
         ],
+        http_headers: Optional[dict] = None,
     ):
-        return run_query(statement, snowflake_service)
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                # Try to get headers from HTTP request directly
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    # Fallback to get_http_headers()
+                    http_headers = get_http_headers(include_all=True)
+            except Exception as e:
+                http_headers = {}
+        return run_query(statement, snowflake_service, headers=http_headers)
 
 
 def get_statement_type(sql_string):

@@ -13,6 +13,7 @@ from typing import Annotated, Optional
 
 import requests
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 
 from mcp_server_snowflake.cortex_services.prompts import (
@@ -34,6 +35,7 @@ async def query_cortex_agent(
     database_name: str,
     schema_name: str,
     query: str,
+    http_headers: Optional[dict] = None,
 ) -> dict:
     """
     Query a Cortex Agent Service using the REST API.
@@ -52,6 +54,8 @@ async def query_cortex_agent(
         Target schema containing the agent service
     query : str
         The user query string to submit to Cortex Agent
+    http_headers : dict
+        HTTP request headers (injected automatically)
 
     Returns
     -------
@@ -68,9 +72,33 @@ async def query_cortex_agent(
     Snowflake Cortex Agent REST API (for Agent Objects):
     https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-rest-api
     """
-    host, headers = construct_snowflake_post(
+    # Get headers if not provided (for multi-tenant mode)
+    if http_headers is None:
+        try:
+            # Try to get headers from HTTP request directly
+            request = get_http_request()
+            if request:
+                http_headers = dict(request.headers)
+            else:
+                # Fallback to get_http_headers()
+                http_headers = get_http_headers(include_all=True)
+        except Exception:
+            http_headers = {}
+    
+    # Get connection for multi-tenant mode
+    connection = None
+    if snowflake_service.transport == "streamable-http" and http_headers:
+        try:
+            conn, _, _ = snowflake_service.get_connection_from_headers(http_headers)
+            connection = conn
+        except Exception as e:
+            # If headers are not available or invalid, fall back to default connection
+            pass
+    
+    host, api_headers = construct_snowflake_post(
         service=snowflake_service,
         api_path=f"/api/v2/databases/{database_name}/schemas/{schema_name}/agents/{service_name}:run",
+        connection=connection,
     )
 
     payload = {
@@ -80,7 +108,7 @@ async def query_cortex_agent(
     }
     try:
         response = requests.post(
-            host, headers=headers, json=payload, stream=True, timeout=120
+            host, headers=api_headers, json=payload, stream=True, timeout=120
         )
     except requests.exceptions.Timeout:
         raise SnowflakeException(
@@ -109,6 +137,7 @@ async def query_cortex_search(
     columns: Optional[list[str]] = None,
     filter_query: Optional[dict] = {},
     limit: Optional[int] = 10,
+    http_headers: Optional[dict] = None,
 ) -> dict:
     """
     Query a Cortex Search Service using the REST API.
@@ -134,6 +163,8 @@ async def query_cortex_search(
         Filter query to apply to search results, by default {}
     limit : int, optional
         Limit on the number of results to return, by default 10
+    http_headers : dict
+        HTTP request headers (injected automatically)
 
     Returns
     -------
@@ -150,9 +181,33 @@ async def query_cortex_search(
     Snowflake Cortex Search REST API:
     https://docs.snowflake.com/developer-guide/snowflake-rest-api/reference/cortex-search-service
     """
-    host, headers = construct_snowflake_post(
+    # Get headers if not provided (for multi-tenant mode)
+    if http_headers is None:
+        try:
+            # Try to get headers from HTTP request directly
+            request = get_http_request()
+            if request:
+                http_headers = dict(request.headers)
+            else:
+                # Fallback to get_http_headers()
+                http_headers = get_http_headers(include_all=True)
+        except Exception:
+            http_headers = {}
+    
+    # Get connection for multi-tenant mode
+    connection = None
+    if snowflake_service.transport == "streamable-http" and http_headers:
+        try:
+            conn, _, _ = snowflake_service.get_connection_from_headers(http_headers)
+            connection = conn
+        except Exception as e:
+            # If headers are not available or invalid, fall back to default connection
+            pass
+    
+    host, api_headers = construct_snowflake_post(
         service=snowflake_service,
         api_path=f"/api/v2/databases/{database_name}/schemas/{schema_name}/cortex-search-services/{service_name}:query",
+        connection=connection,
     )
 
     if filter_query is None:
@@ -175,7 +230,7 @@ async def query_cortex_search(
     if isinstance(columns, list) and len(columns) > 0:
         payload["columns"] = columns
     try:
-        response = requests.post(host, headers=headers, json=payload, timeout=60)
+        response = requests.post(host, headers=api_headers, json=payload, timeout=60)
     except requests.exceptions.Timeout:
         raise SnowflakeException(
             tool="Cortex Search",
@@ -198,6 +253,7 @@ async def query_cortex_analyst(
     snowflake_service,
     semantic_model: str,
     query: str,
+    http_headers: Optional[dict] = None,
 ) -> dict:
     """
     Query Snowflake Cortex Analyst service for natural language to SQL conversion.
@@ -216,6 +272,8 @@ async def query_cortex_analyst(
         - "MY_DB.MY_SCH.MY_SEMANTIC_VIEW"
     query : str
         Natural language query string to submit to Cortex Analyst
+    http_headers : dict
+        HTTP request headers (injected automatically)
 
     Returns
     -------
@@ -234,9 +292,33 @@ async def query_cortex_analyst(
     refers to a YAML file (starts with @ and ends with .yaml) or a semantic view.
     Currently configured for non-streaming responses.
     """
-    host, headers = construct_snowflake_post(
+    # Get headers if not provided (for multi-tenant mode)
+    if http_headers is None:
+        try:
+            # Try to get headers from HTTP request directly
+            request = get_http_request()
+            if request:
+                http_headers = dict(request.headers)
+            else:
+                # Fallback to get_http_headers()
+                http_headers = get_http_headers(include_all=True)
+        except Exception:
+            http_headers = {}
+    
+    # Get connection for multi-tenant mode
+    connection = None
+    if snowflake_service.transport == "streamable-http" and http_headers:
+        try:
+            conn, _, _ = snowflake_service.get_connection_from_headers(http_headers)
+            connection = conn
+        except Exception as e:
+            # If headers are not available or invalid, fall back to default connection
+            pass
+    
+    host, api_headers = construct_snowflake_post(
         service=snowflake_service,
         api_path="/api/v2/cortex/analyst/message",
+        connection=connection,
     )
 
     if semantic_model.startswith("@") and semantic_model.endswith(".yaml"):
@@ -261,7 +343,7 @@ async def query_cortex_analyst(
     }
 
     try:
-        response = requests.post(host, headers=headers, json=payload, timeout=120)
+        response = requests.post(host, headers=api_headers, json=payload, timeout=120)
     except requests.exceptions.Timeout:
         raise SnowflakeException(
             tool="Cortex Analyst",
