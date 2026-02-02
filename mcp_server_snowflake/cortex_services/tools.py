@@ -13,6 +13,7 @@ from typing import Annotated, Optional
 
 import requests
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 
 from mcp_server_snowflake.cortex_services.prompts import (
@@ -22,9 +23,127 @@ from mcp_server_snowflake.cortex_services.prompts import (
     get_cortex_search_description,
 )
 from mcp_server_snowflake.environment import construct_snowflake_post
-from mcp_server_snowflake.utils import SnowflakeException, SnowflakeResponse
+from mcp_server_snowflake.utils import SnowflakeException, SnowflakeResponse, execute_query
 
 sfse = SnowflakeResponse()
+
+
+def list_cortex_search_services(
+    snowflake_service,
+    database_name: str = None,
+    schema_name: str = None,
+    like: str = None,
+    starts_with: str = None,
+    headers: dict = None,
+):
+    """
+    List all accessible Cortex Search services.
+    
+    Parameters
+    ----------
+    snowflake_service
+        Snowflake service instance
+    database_name : str, optional
+        Filter by database name
+    schema_name : str, optional
+        Filter by schema name (requires database_name)
+    like : str, optional
+        Filter by pattern matching in service name
+    starts_with : str, optional
+        Filter by service name starting with string
+    headers : dict, optional
+        HTTP headers for multi-tenant mode
+        
+    Returns
+    -------
+    list[dict]
+        List of Cortex Search service metadata
+    """
+    statement = "SHOW CORTEX SEARCH SERVICES"
+    bindvars = []
+    
+    if like:
+        statement += " LIKE ?"
+        bindvars.extend([f"%{like.replace('%', '')}%"])
+    
+    if database_name and schema_name:
+        statement += " IN SCHEMA identifier(?)"
+        bindvars.extend([f"{database_name}.{schema_name}"])
+    elif database_name:
+        statement += " IN DATABASE identifier(?)"
+        bindvars.extend([database_name])
+    
+    if starts_with:
+        sanitized_starts_with = starts_with.replace("'", "")
+        statement += f" STARTS WITH '{sanitized_starts_with}'"
+    
+    try:
+        result = execute_query(statement, snowflake_service, bindvars, headers=headers)
+        if not result:
+            return "No Cortex Search services found."
+        return result
+    except Exception as e:
+        raise SnowflakeException(tool="list_cortex_search_services", message=str(e))
+
+
+def list_cortex_agent_services(
+    snowflake_service,
+    database_name: str = None,
+    schema_name: str = None,
+    like: str = None,
+    starts_with: str = None,
+    headers: dict = None,
+):
+    """
+    List all accessible Cortex Agent services.
+    
+    Parameters
+    ----------
+    snowflake_service
+        Snowflake service instance
+    database_name : str, optional
+        Filter by database name
+    schema_name : str, optional
+        Filter by schema name (requires database_name)
+    like : str, optional
+        Filter by pattern matching in service name
+    starts_with : str, optional
+        Filter by service name starting with string
+    headers : dict, optional
+        HTTP headers for multi-tenant mode
+        
+    Returns
+    -------
+    list[dict]
+        List of Cortex Agent service metadata
+    """
+    statement = "SHOW AGENTS"
+    bindvars = []
+    
+    if like:
+        statement += " LIKE ?"
+        bindvars.extend([f"%{like.replace('%', '')}%"])
+    
+    if database_name and schema_name:
+        statement += " IN SCHEMA identifier(?)"
+        bindvars.extend([f"{database_name}.{schema_name}"])
+    elif database_name:
+        statement += " IN DATABASE identifier(?)"
+        bindvars.extend([database_name])
+    elif not database_name and not schema_name:
+        statement += " IN ACCOUNT"
+    
+    if starts_with:
+        sanitized_starts_with = starts_with.replace("'", "")
+        statement += f" STARTS WITH '{sanitized_starts_with}'"
+    
+    try:
+        result = execute_query(statement, snowflake_service, bindvars, headers=headers)
+        if not result:
+            return "No Cortex Agent services found."
+        return result
+    except Exception as e:
+        raise SnowflakeException(tool="list_cortex_agent_services", message=str(e))
 
 
 @sfse.snowflake_response(api="agent")
@@ -34,6 +153,7 @@ async def query_cortex_agent(
     database_name: str,
     schema_name: str,
     query: str,
+    http_headers: Optional[dict] = None,
 ) -> dict:
     """
     Query a Cortex Agent Service using the REST API.
@@ -52,6 +172,8 @@ async def query_cortex_agent(
         Target schema containing the agent service
     query : str
         The user query string to submit to Cortex Agent
+    http_headers : dict
+        HTTP request headers (injected automatically)
 
     Returns
     -------
@@ -68,9 +190,33 @@ async def query_cortex_agent(
     Snowflake Cortex Agent REST API (for Agent Objects):
     https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-rest-api
     """
-    host, headers = construct_snowflake_post(
+    # Get headers if not provided (for multi-tenant mode)
+    if http_headers is None:
+        try:
+            # Try to get headers from HTTP request directly
+            request = get_http_request()
+            if request:
+                http_headers = dict(request.headers)
+            else:
+                # Fallback to get_http_headers()
+                http_headers = get_http_headers(include_all=True)
+        except Exception:
+            http_headers = {}
+    
+    # Get connection for multi-tenant mode
+    connection = None
+    if snowflake_service.transport == "streamable-http" and http_headers:
+        try:
+            conn, _, _ = snowflake_service.get_connection_from_headers(http_headers)
+            connection = conn
+        except Exception as e:
+            # If headers are not available or invalid, fall back to default connection
+            pass
+    
+    host, api_headers = construct_snowflake_post(
         service=snowflake_service,
         api_path=f"/api/v2/databases/{database_name}/schemas/{schema_name}/agents/{service_name}:run",
+        connection=connection,
     )
 
     payload = {
@@ -80,7 +226,7 @@ async def query_cortex_agent(
     }
     try:
         response = requests.post(
-            host, headers=headers, json=payload, stream=True, timeout=120
+            host, headers=api_headers, json=payload, stream=True, timeout=120
         )
     except requests.exceptions.Timeout:
         raise SnowflakeException(
@@ -109,6 +255,7 @@ async def query_cortex_search(
     columns: Optional[list[str]] = None,
     filter_query: Optional[dict] = {},
     limit: Optional[int] = 10,
+    http_headers: Optional[dict] = None,
 ) -> dict:
     """
     Query a Cortex Search Service using the REST API.
@@ -134,6 +281,8 @@ async def query_cortex_search(
         Filter query to apply to search results, by default {}
     limit : int, optional
         Limit on the number of results to return, by default 10
+    http_headers : dict
+        HTTP request headers (injected automatically)
 
     Returns
     -------
@@ -150,9 +299,33 @@ async def query_cortex_search(
     Snowflake Cortex Search REST API:
     https://docs.snowflake.com/developer-guide/snowflake-rest-api/reference/cortex-search-service
     """
-    host, headers = construct_snowflake_post(
+    # Get headers if not provided (for multi-tenant mode)
+    if http_headers is None:
+        try:
+            # Try to get headers from HTTP request directly
+            request = get_http_request()
+            if request:
+                http_headers = dict(request.headers)
+            else:
+                # Fallback to get_http_headers()
+                http_headers = get_http_headers(include_all=True)
+        except Exception:
+            http_headers = {}
+    
+    # Get connection for multi-tenant mode
+    connection = None
+    if snowflake_service.transport == "streamable-http" and http_headers:
+        try:
+            conn, _, _ = snowflake_service.get_connection_from_headers(http_headers)
+            connection = conn
+        except Exception as e:
+            # If headers are not available or invalid, fall back to default connection
+            pass
+    
+    host, api_headers = construct_snowflake_post(
         service=snowflake_service,
         api_path=f"/api/v2/databases/{database_name}/schemas/{schema_name}/cortex-search-services/{service_name}:query",
+        connection=connection,
     )
 
     if filter_query is None:
@@ -175,7 +348,7 @@ async def query_cortex_search(
     if isinstance(columns, list) and len(columns) > 0:
         payload["columns"] = columns
     try:
-        response = requests.post(host, headers=headers, json=payload, timeout=60)
+        response = requests.post(host, headers=api_headers, json=payload, timeout=60)
     except requests.exceptions.Timeout:
         raise SnowflakeException(
             tool="Cortex Search",
@@ -198,6 +371,7 @@ async def query_cortex_analyst(
     snowflake_service,
     semantic_model: str,
     query: str,
+    http_headers: Optional[dict] = None,
 ) -> dict:
     """
     Query Snowflake Cortex Analyst service for natural language to SQL conversion.
@@ -216,6 +390,8 @@ async def query_cortex_analyst(
         - "MY_DB.MY_SCH.MY_SEMANTIC_VIEW"
     query : str
         Natural language query string to submit to Cortex Analyst
+    http_headers : dict
+        HTTP request headers (injected automatically)
 
     Returns
     -------
@@ -234,9 +410,33 @@ async def query_cortex_analyst(
     refers to a YAML file (starts with @ and ends with .yaml) or a semantic view.
     Currently configured for non-streaming responses.
     """
-    host, headers = construct_snowflake_post(
+    # Get headers if not provided (for multi-tenant mode)
+    if http_headers is None:
+        try:
+            # Try to get headers from HTTP request directly
+            request = get_http_request()
+            if request:
+                http_headers = dict(request.headers)
+            else:
+                # Fallback to get_http_headers()
+                http_headers = get_http_headers(include_all=True)
+        except Exception:
+            http_headers = {}
+    
+    # Get connection for multi-tenant mode
+    connection = None
+    if snowflake_service.transport == "streamable-http" and http_headers:
+        try:
+            conn, _, _ = snowflake_service.get_connection_from_headers(http_headers)
+            connection = conn
+        except Exception as e:
+            # If headers are not available or invalid, fall back to default connection
+            pass
+    
+    host, api_headers = construct_snowflake_post(
         service=snowflake_service,
         api_path="/api/v2/cortex/analyst/message",
+        connection=connection,
     )
 
     if semantic_model.startswith("@") and semantic_model.endswith(".yaml"):
@@ -261,7 +461,7 @@ async def query_cortex_analyst(
     }
 
     try:
-        response = requests.post(host, headers=headers, json=payload, timeout=120)
+        response = requests.post(host, headers=api_headers, json=payload, timeout=120)
     except requests.exceptions.Timeout:
         raise SnowflakeException(
             tool="Cortex Analyst",
@@ -280,90 +480,180 @@ async def query_cortex_analyst(
 
 
 def initialize_cortex_agent_tool(server: FastMCP, snowflake_service):
-    if snowflake_service.agent_services:
-
-        @server.tool(
-            name="cortex_agent",
-            description=get_cortex_agent_description(snowflake_service.agent_services),
+    # Always register the tool, even if no services are pre-configured
+    # This allows dynamic discovery and execution
+    
+    @server.tool(
+        name="list_cortex_agent_services",
+        description="List all accessible Cortex Agent services in your Snowflake account. Optionally filter by database, schema, or name pattern.",
+    )
+    def list_cortex_agent_services_tool(
+        database_name: Annotated[
+            str | None,
+            Field(description="Filter by database name"),
+        ] = None,
+        schema_name: Annotated[
+            str | None,
+            Field(description="Filter by schema name (requires database_name)"),
+        ] = None,
+        like: Annotated[
+            str | None,
+            Field(description="Filter by pattern matching in service name (case-insensitive, supports % and _ wildcards)"),
+        ] = None,
+        starts_with: Annotated[
+            str | None,
+            Field(description="Filter by service name starting with string (case-sensitive)"),
+        ] = None,
+        http_headers: Optional[dict] = None,
+    ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
+        return list_cortex_agent_services(
+            snowflake_service=snowflake_service,
+            database_name=database_name,
+            schema_name=schema_name,
+            like=like,
+            starts_with=starts_with,
+            headers=http_headers,
         )
-        def run_cortex_agent_tool(
-            service_name: Annotated[
-                str,
-                Field(description="Name of the Cortex Agent Service"),
-            ],
-            database_name: Annotated[
-                str,
-                Field(description="Target database containing the agent service"),
-            ],
-            schema_name: Annotated[
-                str,
-                Field(description="Target schema containing the agent service"),
-            ],
-            query: Annotated[
-                str,
-                Field(description="User query to submit to Cortex Agent"),
-            ],
-        ):
-            return query_cortex_agent(
-                snowflake_service=snowflake_service,
-                service_name=service_name,
-                database_name=database_name,
-                schema_name=schema_name,
-                query=query,
-            )
+    
+    # Register execution tool - always available for dynamic execution
+    description = get_cortex_agent_description(snowflake_service.agent_services) if snowflake_service.agent_services else "Cortex Agent tool that combines structured and unstructured data querying. Use list_cortex_agent_services to discover available agents."
+    
+    @server.tool(
+        name="cortex_agent",
+        description=description,
+    )
+    def run_cortex_agent_tool(
+        service_name: Annotated[
+            str,
+            Field(description="Name of the Cortex Agent Service"),
+        ],
+        database_name: Annotated[
+            str,
+            Field(description="Target database containing the agent service"),
+        ],
+        schema_name: Annotated[
+            str,
+            Field(description="Target schema containing the agent service"),
+        ],
+        query: Annotated[
+            str,
+            Field(description="User query to submit to Cortex Agent"),
+        ],
+    ):
+        return query_cortex_agent(
+            snowflake_service=snowflake_service,
+            service_name=service_name,
+            database_name=database_name,
+            schema_name=schema_name,
+            query=query,
+        )
 
 
 def initialize_cortex_search_tool(server: FastMCP, snowflake_service):
-    if snowflake_service.search_services:
-
-        @server.tool(
-            name="cortex_search",
-            description=get_cortex_search_description(
-                snowflake_service.search_services
-            ),
+    # Always register the tool, even if no services are pre-configured
+    # This allows dynamic discovery and execution
+    
+    @server.tool(
+        name="list_cortex_search_services",
+        description="List all accessible Cortex Search services in your Snowflake account. Optionally filter by database, schema, or name pattern.",
+    )
+    def list_cortex_search_services_tool(
+        database_name: Annotated[
+            str | None,
+            Field(description="Filter by database name"),
+        ] = None,
+        schema_name: Annotated[
+            str | None,
+            Field(description="Filter by schema name (requires database_name)"),
+        ] = None,
+        like: Annotated[
+            str | None,
+            Field(description="Filter by pattern matching in service name (case-insensitive, supports % and _ wildcards)"),
+        ] = None,
+        starts_with: Annotated[
+            str | None,
+            Field(description="Filter by service name starting with string (case-sensitive)"),
+        ] = None,
+        http_headers: Optional[dict] = None,
+    ):
+        # Get headers if not provided (for multi-tenant mode)
+        if http_headers is None:
+            try:
+                request = get_http_request()
+                if request:
+                    http_headers = dict(request.headers)
+                else:
+                    http_headers = get_http_headers(include_all=True)
+            except Exception:
+                http_headers = {}
+        return list_cortex_search_services(
+            snowflake_service=snowflake_service,
+            database_name=database_name,
+            schema_name=schema_name,
+            like=like,
+            starts_with=starts_with,
+            headers=http_headers,
         )
-        def run_cortex_search_tool(
-            service_name: Annotated[
-                str,
-                Field(description="Name of the Cortex Search Service"),
-            ],
-            database_name: Annotated[
-                str,
-                Field(description="Target database containing the search service"),
-            ],
-            schema_name: Annotated[
-                str,
-                Field(description="Target schema containing the search service"),
-            ],
-            query: Annotated[
-                str,
-                Field(description="User query to search in search service"),
-            ],
-            columns: Annotated[
-                list[str],
-                Field(
-                    description="Optional list of columns to return for each relevant result in the response"
-                ),
-            ] = [],
-            filter_query: Annotated[
-                dict,
-                Field(description=cortex_search_filter_description),
-            ] = {},
-            limit: Annotated[
-                int,
-                Field(description="Optional limit on the number of results to return"),
-            ] = 10,
-        ):
-            return query_cortex_search(
-                snowflake_service=snowflake_service,
-                service_name=service_name,
-                database_name=database_name,
-                schema_name=schema_name,
-                query=query,
-                columns=columns,
-                filter_query=filter_query,
-                limit=limit,
-            )
+    
+    # Register execution tool - always available for dynamic execution
+    description = get_cortex_search_description(snowflake_service.search_services) if snowflake_service.search_services else "Search tool that performs semantic search against a configured Cortex Search service. Use list_cortex_search_services to discover available services."
+    
+    @server.tool(
+        name="cortex_search",
+        description=description,
+    )
+    def run_cortex_search_tool(
+        service_name: Annotated[
+            str,
+            Field(description="Name of the Cortex Search Service"),
+        ],
+        database_name: Annotated[
+            str,
+            Field(description="Target database containing the search service"),
+        ],
+        schema_name: Annotated[
+            str,
+            Field(description="Target schema containing the search service"),
+        ],
+        query: Annotated[
+            str,
+            Field(description="User query to search in search service"),
+        ],
+        columns: Annotated[
+            list[str],
+            Field(
+                description="Optional list of columns to return for each relevant result in the response"
+            ),
+        ] = [],
+        filter_query: Annotated[
+            dict,
+            Field(description=cortex_search_filter_description),
+        ] = {},
+        limit: Annotated[
+            int,
+            Field(description="Optional limit on the number of results to return"),
+        ] = 10,
+    ):
+        return query_cortex_search(
+            snowflake_service=snowflake_service,
+            service_name=service_name,
+            database_name=database_name,
+            schema_name=schema_name,
+            query=query,
+            columns=columns,
+            filter_query=filter_query,
+            limit=limit,
+        )
 
 
 def initialize_cortex_analyst_tool(server: FastMCP, snowflake_service):

@@ -1,0 +1,30 @@
+# Snowflake MCP Server Configuration
+# Minimal configuration - customize as needed
+
+agent_services: []
+search_services: []
+analyst_services: []
+
+other_services:
+  object_manager: true
+  query_manager: true
+  semantic_manager: true
+
+sql_statement_permissions:
+  - Alter: false
+  - Command: false
+  - Comment: true
+  - Commit: false
+  - Create: false
+  - Delete: false
+  - Describe: true
+  - Drop: false
+  - Insert: false
+  - Merge: false
+  - Rollback: false
+  - Select: true
+  - Transaction: false
+  - TruncateTable: false
+  - Unknown: false
+  - Update: false
+  - Use: true

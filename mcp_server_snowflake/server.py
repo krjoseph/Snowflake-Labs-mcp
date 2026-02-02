@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import datetime
 import json
 import os
 from collections.abc import AsyncIterator
@@ -21,6 +22,7 @@ import yaml
 from fastmcp import FastMCP
 from fastmcp.utilities.logging import get_logger
 from snowflake.connector import DictCursor, connect
+from snowflake.connector.network import ReauthenticationRequest
 from snowflake.core import Root
 
 from mcp_server_snowflake.cortex_services.tools import (
@@ -37,6 +39,7 @@ from mcp_server_snowflake.query_manager.tools import initialize_query_manager_to
 from mcp_server_snowflake.semantic_manager.tools import (
     initialize_semantic_manager_tools,
 )
+from mcp_server_snowflake.connection_pool import ConnectionPool
 from mcp_server_snowflake.server_utils import initialize_middleware
 from mcp_server_snowflake.utils import (
     cleanup_snowflake_service,
@@ -140,10 +143,18 @@ class SnowflakeService:
         # Environment detection for authentication
         self._is_spcs_container = is_running_in_spcs_container()
 
+        # Connection pool for multi-tenant support (streamable-http only)
+        self._connection_pool = ConnectionPool() if self.transport == "streamable-http" else None
+
         self.unpack_service_specs()
         # Persist connection to avoid closing it after each request
-        self.connection = self._get_persistent_connection()
-        self.root = Root(self.connection)
+        # Skip for streamable-http transport (multi-tenant mode)
+        if self.transport == "streamable-http":
+            self.connection = None
+            self.root = None
+        else:
+            self.connection = self._get_persistent_connection()
+            self.root = Root(self.connection)
 
     def unpack_service_specs(self) -> None:
         """
@@ -188,15 +199,88 @@ class SnowflakeService:
             logger.error(f"Error extracting service specifications: {e}")
             raise
 
-    def get_api_headers(self) -> Dict[str, str]:
+    def extract_credentials_from_headers(self, headers: Dict[str, str]) -> Dict[str, Optional[str]]:
+        """
+        Extract Snowflake credentials from HTTP headers.
+        
+        Parameters
+        ----------
+        headers : Dict[str, str]
+            HTTP request headers
+            
+        Returns
+        -------
+        Dict[str, Optional[str]]
+            Dictionary with keys: token, account, user, role, warehouse
+        """
+        # Extract PAT from Authorization header: "Bearer <PAT>"
+        # HTTP headers are case-insensitive, so check both lowercase and original case
+        auth_header = None
+        for key in headers.keys():
+            if key.lower() == "authorization":
+                auth_header = headers[key]
+                break
+        
+        token = None
+        if auth_header:
+            # Handle "Bearer <token>" format (case-insensitive)
+            # Split on whitespace and take the second part (the token)
+            parts = auth_header.split(None, 1)  # Split on whitespace, max 1 split
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                token = parts[1].strip()
+            elif auth_header.lower().startswith("bearer "):
+                # Fallback: extract after "Bearer " (7 characters)
+                token = auth_header[7:].strip()
+            elif auth_header.lower().startswith("bearer"):
+                # Fallback: extract after "Bearer" (6 characters) if no space
+                token = auth_header[6:].strip() if len(auth_header) > 6 else None
+            
+            logger.debug(f"Extracted token from Authorization header - length: {len(token) if token else 0}, starts_with: {token[:20] if token and len(token) > 20 else token if token else 'None'}...")
+        
+        # Extract Snowflake-specific headers (case-insensitive)
+        account = None
+        user = None
+        role = None
+        warehouse = None
+        
+        for key, value in headers.items():
+            key_lower = key.lower()
+            if key_lower == "x-snowflake-account":
+                account = value
+            elif key_lower == "x-snowflake-user":
+                user = value
+            elif key_lower == "x-snowflake-role":
+                role = value
+            elif key_lower == "x-snowflake-compute-wh" or key_lower == "x-snowflake-warehouse":
+                warehouse = value
+        
+        return {
+            "token": token,
+            "account": account,
+            "user": user,
+            "role": role,
+            "warehouse": warehouse,
+        }
+
+    def get_api_headers(self, connection: Optional[Any] = None) -> Dict[str, str]:
         """
         Get authentication headers for REST API calls.
+
+        Parameters
+        ----------
+        connection : Connection, optional
+            Snowflake connection to use. If None, uses self.connection.
+            Required for multi-tenant mode.
 
         Returns
         -------
         Dict[str, str]
             HTTP headers with authentication
         """
+        conn = connection or self.connection
+        if conn is None:
+            raise ValueError("No connection available. Provide connection parameter for multi-tenant mode.")
+        
         if self._is_spcs_container:
             return {
                 "Authorization": f"Bearer {get_spcs_container_token()}",
@@ -208,24 +292,34 @@ class SnowflakeService:
             return {
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
-                "Authorization": f'Snowflake Token="{self.connection.rest.token}"',
+                "Authorization": f'Snowflake Token="{conn.rest.token}"',
             }
 
-    def get_api_host(self) -> str:
+    def get_api_host(self, connection: Optional[Any] = None) -> str:
         """
         Get the API host for REST API calls.
+
+        Parameters
+        ----------
+        connection : Connection, optional
+            Snowflake connection to use. If None, uses self.connection.
+            Required for multi-tenant mode.
 
         Returns
         -------
         str
             API host URL
         """
+        conn = connection or self.connection
+        if conn is None:
+            raise ValueError("No connection available. Provide connection parameter for multi-tenant mode.")
+        
         if self._is_spcs_container:
             return os.getenv(
                 "SNOWFLAKE_HOST", self.connection_params.get("account", "")
             )
         else:
-            return self.connection.host
+            return conn.host
 
     @staticmethod
     def send_initial_query(connection: Any) -> None:
@@ -283,6 +377,13 @@ class SnowflakeService:
             else:
                 logger.info("Using external authentication")
                 connection_params = self.connection_params.copy()
+                # Log OAuth token info if using OAuth (without exposing the actual token)
+                if connection_params.get("authenticator") == "oauth" and "token" in connection_params:
+                    token_preview = connection_params["token"][:20] + "..." if len(connection_params["token"]) > 20 else connection_params["token"]
+                    logger.debug(f"Using OAuth token (preview: {token_preview})")
+                    # Check if token looks valid (basic format check)
+                    if not connection_params["token"] or len(connection_params["token"].strip()) == 0:
+                        logger.warning("OAuth token appears to be empty")
 
             # We are passing session_parameters and client_session_keep_alive
             # so we cannot rely on the connection to infer default connection name.
@@ -303,15 +404,229 @@ class SnowflakeService:
             if connection:  # Send zero compute query to capture query tag
                 self.send_initial_query(connection)
                 return connection
+        except ReauthenticationRequest as e:
+            # OAuth token has expired or is invalid
+            current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            error_msg = (
+                f"OAuth authentication failed: {e}\n\n"
+                "The OAuth access token has expired or is invalid.\n\n"
+                "Possible causes:\n"
+                "1. The token has actually expired (check token expiration time)\n"
+                f"2. System clock skew (current UTC time: {current_time})\n"
+                "3. Token format or source mismatch\n"
+                "4. Token was revoked or invalidated\n\n"
+                "Solutions:\n"
+                "- Obtain a new OAuth access token from your OAuth provider\n"
+                "- Update your configuration with the new token\n"
+                f"- Ensure your system clock is synchronized (current UTC: {current_time})\n"
+                "- Verify the token is for the correct Snowflake account\n\n"
+                "Note: The Snowflake Python Connector does not automatically refresh OAuth tokens. "
+                "You must provide a valid, non-expired access token."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
         except Exception as e:
             logger.error(f"Error establishing persistent Snowflake connection: {e}")
             raise
+
+    def _create_connection_from_credentials(
+        self,
+        token: str,
+        account: str,
+        user: str,
+        role: Optional[str] = None,
+        warehouse: Optional[str] = None,
+        session_parameters: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """
+        Create a Snowflake connection from credentials.
+        
+        Parameters
+        ----------
+        token : str
+            OAuth token (PAT)
+        account : str
+            Snowflake account identifier
+        user : str
+            Snowflake username
+        role : str, optional
+            Snowflake role
+        warehouse : str, optional
+            Snowflake warehouse
+        session_parameters : dict, optional
+            Additional session parameters
+            
+        Returns
+        -------
+        Connection
+            Snowflake connection object
+        """
+        query_tag_params = self.get_query_tag_param()
+        
+        if session_parameters is not None:
+            if query_tag_params:
+                session_parameters.update(query_tag_params)
+        else:
+            session_parameters = query_tag_params
+        
+        # Validate token is not empty
+        if not token or not token.strip():
+            raise ValueError("Token is empty or invalid")
+        
+        # Clean the token - remove any extra whitespace
+        clean_token = token.strip()
+        
+        # Try to decode JWT to check expiration (if it's a JWT)
+        try:
+            import base64
+            import json
+            # JWT format: header.payload.signature
+            parts = clean_token.split('.')
+            if len(parts) >= 2:
+                # Decode payload (add padding if needed)
+                payload = parts[1]
+                # Add padding if needed for base64 decoding
+                padding = 4 - len(payload) % 4
+                if padding != 4:
+                    payload += '=' * padding
+                decoded = base64.urlsafe_b64decode(payload)
+                payload_data = json.loads(decoded)
+                exp = payload_data.get('exp')
+                if exp:
+                    import time
+                    current_time = time.time()
+                    if exp < current_time:
+                        logger.warning(f"Token appears to be expired. Exp: {exp} ({time.ctime(exp)}), Current: {current_time} ({time.ctime(current_time)})")
+                    else:
+                        logger.debug(f"Token expiration check - Exp: {time.ctime(exp)}, Current: {time.ctime(current_time)}, Valid for: {int((exp - current_time) / 60)} minutes")
+        except Exception as e:
+            # Not a JWT or can't decode - that's okay, continue
+            logger.debug(f"Could not decode token as JWT (this is okay): {e}")
+        
+        # Personal Access Tokens (PATs) should be used as password, not as OAuth token
+        # According to Snowflake docs: "To authenticate with a programmatic access token as the password,
+        # you can specify the token for the value of the password in the driver settings"
+        
+        # Validate and log account and user values
+        if not account or not account.strip():
+            raise ValueError("Account cannot be empty")
+        if not user or not user.strip():
+            raise ValueError("User cannot be empty")
+        
+        account_clean = account.strip()
+        user_clean = user.strip()
+        
+        logger.info(f"Connection parameters - account: '{account_clean}' (length: {len(account_clean)}), user: '{user_clean}' (length: {len(user_clean)}), role: '{role}' (length: {len(role) if role else 0}), warehouse: '{warehouse}' (length: {len(warehouse) if warehouse else 0}), token_length: {len(clean_token)}, token_preview: {clean_token[:30] + '...' if len(clean_token) > 30 else clean_token}")
+        
+        connection_params = {
+            "account": account_clean,
+            "user": user_clean,
+            "password": clean_token,  # PATs go in password field, not token field
+            # No authenticator="oauth" needed for PATs - they replace passwords
+        }
+        
+        if role:
+            connection_params["role"] = role.strip() if isinstance(role, str) else role
+        if warehouse:
+            connection_params["warehouse"] = warehouse.strip() if isinstance(warehouse, str) else warehouse
+        
+        logger.debug(f"Final connection_params dict: { {k: (v[:20] + '...' if isinstance(v, str) and len(v) > 20 else v) if k == 'password' else v for k, v in connection_params.items()} }")
+        
+        try:
+            connection = connect(
+                **connection_params,
+                session_parameters=session_parameters,
+                client_session_keep_alive=True,
+                paramstyle="qmark",
+            )
+            
+            if connection:
+                self.send_initial_query(connection)
+            
+            return connection
+        except Exception as e:
+            logger.error(f"Failed to create connection - account: {account}, user: {user}, error: {e}")
+            raise
+
+    def get_connection_from_headers(
+        self,
+        headers: Dict[str, str],
+        use_dict_cursor: bool = False,
+        session_parameters: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Any, Any, Root]:
+        """
+        Get a Snowflake connection from HTTP headers (multi-tenant mode).
+        
+        Parameters
+        ----------
+        headers : Dict[str, str]
+            HTTP request headers
+        use_dict_cursor : bool, default=False
+            Whether to use DictCursor instead of regular cursor
+        session_parameters : dict, optional
+            Additional session parameters
+            
+        Returns
+        -------
+        tuple
+            A tuple containing (connection, cursor, root)
+        """
+        if self.transport != "streamable-http":
+            raise ValueError("get_connection_from_headers() is only available for streamable-http transport")
+        
+        if self._connection_pool is None:
+            raise ValueError("Connection pool not initialized")
+        
+        # Extract credentials from headers
+        logger.debug(f"Raw headers received: {list(headers.keys())}")
+        creds = self.extract_credentials_from_headers(headers)
+        
+        logger.info(f"Extracted credentials - account: {creds.get('account')}, user: {creds.get('user')}, role: {creds.get('role')}, warehouse: {creds.get('warehouse')}, token_present: {bool(creds.get('token'))}, token_length: {len(creds.get('token', ''))}, token_start: {creds.get('token', '')[:30] if creds.get('token') else 'None'}...")
+        
+        if not creds.get("token"):
+            logger.error(f"Missing token. Available headers: {list(headers.keys())}")
+            raise ValueError("Missing Authorization header with Bearer token")
+        if not creds.get("account"):
+            logger.error(f"Missing account. Available headers: {list(headers.keys())}")
+            raise ValueError("Missing X-Snowflake-Account header")
+        if not creds.get("user"):
+            logger.error(f"Missing user. Available headers: {list(headers.keys())}")
+            raise ValueError("Missing X-Snowflake-User header")
+        
+        # Get connection from pool
+        def connection_factory():
+            return self._create_connection_from_credentials(
+                token=creds["token"],
+                account=creds["account"],
+                user=creds["user"],
+                role=creds.get("role"),
+                warehouse=creds.get("warehouse"),
+                session_parameters=session_parameters,
+            )
+        
+        conn, root = self._connection_pool.get_connection(
+            connection_factory=connection_factory,
+            token=creds["token"],
+            account=creds["account"],
+            user=creds["user"],
+            role=creds.get("role"),
+            warehouse=creds.get("warehouse"),
+        )
+        
+        cursor = (
+            conn.cursor(DictCursor)
+            if use_dict_cursor
+            else conn.cursor()
+        )
+        
+        return conn, cursor, root
 
     @contextmanager
     def get_connection(
         self,
         use_dict_cursor: bool = False,
         session_parameters: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Generator[Tuple[Any, Any], None, None]:
         """
         Get a Snowflake connection with the specified configuration.
@@ -319,8 +634,8 @@ class SnowflakeService:
         This context manager ensures proper connection handling and cleanup.
         It automatically detects the environment and uses appropriate authentication.
 
-        If the connection is not established, it will be established with the specified parameters.
-        If the connection is already established, it will be used and session_parameters ignored.
+        For streamable-http transport, credentials are extracted from headers.
+        For other transports, uses the persistent connection or creates a new one.
 
         Parameters
         ----------
@@ -328,6 +643,8 @@ class SnowflakeService:
             Whether to use DictCursor instead of regular cursor
         session_parameters : dict, optional
             Additional session parameters to add to connection such as query tag
+        headers : dict, optional
+            HTTP headers (required for streamable-http transport)
 
         Yields
         ------
@@ -342,6 +659,24 @@ class SnowflakeService:
         """
 
         try:
+            # Multi-tenant mode: use connection pool
+            if self.transport == "streamable-http":
+                if headers is None:
+                    raise ValueError("headers parameter is required for streamable-http transport")
+                
+                conn, cursor, _ = self.get_connection_from_headers(
+                    headers=headers,
+                    use_dict_cursor=use_dict_cursor,
+                    session_parameters=session_parameters,
+                )
+                
+                try:
+                    yield conn, cursor
+                finally:
+                    cursor.close()
+                return
+            
+            # Single-tenant mode: use persistent connection or create new one
             if self.connection is None:
                 # Get connection parameters based on environment
                 if self._is_spcs_container:
@@ -377,6 +712,27 @@ class SnowflakeService:
             finally:
                 cursor.close()
 
+        except ReauthenticationRequest as e:
+            # OAuth token has expired or is invalid
+            current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            error_msg = (
+                f"OAuth authentication failed: {e}\n\n"
+                "The OAuth access token has expired or is invalid.\n\n"
+                "Possible causes:\n"
+                "1. The token has actually expired (check token expiration time)\n"
+                f"2. System clock skew (current UTC time: {current_time})\n"
+                "3. Token format or source mismatch\n"
+                "4. Token was revoked or invalidated\n\n"
+                "Solutions:\n"
+                "- Obtain a new OAuth access token from your OAuth provider\n"
+                "- Update your configuration with the new token\n"
+                f"- Ensure your system clock is synchronized (current UTC: {current_time})\n"
+                "- Verify the token is for the correct Snowflake account\n\n"
+                "Note: The Snowflake Python Connector does not automatically refresh OAuth tokens. "
+                "You must provide a valid, non-expired access token."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
         except Exception as e:
             logger.error(f"Error establishing Snowflake connection: {e}")
             raise
@@ -488,12 +844,14 @@ def parse_arguments():
         default="0.0.0.0",
     )
     # These left as simply port and endpoint for backward compatibility with existing deployments
+    # Check PORT env var for Heroku compatibility (Heroku sets PORT env var)
+    default_port = int(os.environ.get("PORT", 9000))
     parser.add_argument(
         "--port",
         required=False,
         type=int,
-        help="Port number for the server to listen on (default: 9000)",
-        default=9000,
+        help="Port number for the server to listen on (default: 9000, or PORT env var if set)",
+        default=default_port,
     )
     parser.add_argument(
         "--endpoint",
@@ -590,13 +948,11 @@ def initialize_tools(snowflake_service: SnowflakeService, server: FastMCP):
         if snowflake_service.semantic_manager:
             initialize_semantic_manager_tools(server, snowflake_service)
 
-        # Add tool for agent service
-        if snowflake_service.agent_services:
-            initialize_cortex_agent_tool(server, snowflake_service)
+        # Add tools for agent service (always available for dynamic discovery)
+        initialize_cortex_agent_tool(server, snowflake_service)
 
-        # Add tool for search service
-        if snowflake_service.search_services:
-            initialize_cortex_search_tool(server, snowflake_service)
+        # Add tools for search service (always available for dynamic discovery)
+        initialize_cortex_search_tool(server, snowflake_service)
 
         if snowflake_service.analyst_services:
             initialize_cortex_analyst_tool(server, snowflake_service)
@@ -632,9 +988,10 @@ def main():
             "streamable-http",
         ]:
             host = os.environ.get("SNOWFLAKE_MCP_HOST", args.server_host)
-            port = int(os.environ.get("SNOWFLAKE_MCP_PORT", str(args.port)))
+            # Check PORT env var for Heroku compatibility, then SNOWFLAKE_MCP_PORT, then args.port
+            port = int(os.environ.get("PORT") or os.environ.get("SNOWFLAKE_MCP_PORT") or str(args.port))
             endpoint = os.environ.get("SNOWFLAKE_MCP_ENDPOINT", args.endpoint)
-            logger.info(f"Starting server with transport: {args.transport}")
+            logger.info(f"Starting server with transport: {args.transport} on port {port}")
             server.run(transport=args.transport, host=host, port=port, path=endpoint)
         else:
             logger.info(f"Starting server with transport: {args.transport or 'stdio'}")

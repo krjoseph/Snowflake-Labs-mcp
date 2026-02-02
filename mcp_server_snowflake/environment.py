@@ -30,7 +30,7 @@ def is_running_in_spcs_container() -> bool:
     return token_path.exists() and token_path.is_file()
 
 
-def construct_snowflake_post(service, api_path: str) -> tuple[str, dict[str, str]]:
+def construct_snowflake_post(service, api_path: str, connection=None) -> tuple[str, dict[str, str]]:
     """
     Construct a Snowflake API URL based on the environment (SPCS container vs external).
 
@@ -40,6 +40,8 @@ def construct_snowflake_post(service, api_path: str) -> tuple[str, dict[str, str
         Snowflake service instance
     api_path : str
         The API path to append to the base URL (e.g., "/api/v2/cortex/analyst/message")
+    connection : Connection, optional
+        Snowflake connection to use. Required for multi-tenant mode.
 
     Returns
     -------
@@ -56,8 +58,8 @@ def construct_snowflake_post(service, api_path: str) -> tuple[str, dict[str, str
     >>> construct_snowflake_post(service, "/api/v2/cortex/analyst/message")
     ('https://some-host.snowflakecomputing.com/api/v2/cortex/analyst/message', {...})
     """
-    host = service.get_api_host()
-    headers = service.get_api_headers()
+    host = service.get_api_host(connection=connection)
+    headers = service.get_api_headers(connection=connection)
 
     if host.startswith(("http://", "https://")):
         base_url = host
