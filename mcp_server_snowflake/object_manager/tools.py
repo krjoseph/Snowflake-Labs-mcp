@@ -339,11 +339,10 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     )
     def describe_object_tool(
         object_type: object_type_annotation,
-        target_object: optional_target_object_annotation = None,
         database_name: Annotated[
             str | None,
             Field(
-                description="Database name. Use with schema_name and name (or alone for database object_type) when not passing target_object.",
+                description="Database name. Use with schema_name and name (or alone for database object_type) when not passing target_object. For list_objects use the list_objects tool instead.",
                 default=None,
             ),
         ] = None,
@@ -361,6 +360,7 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
                 default=None,
             ),
         ] = None,
+        target_object: optional_target_object_annotation = None,
     ):
         http_headers = get_request_headers_for_tools()
         if target_object is None:
@@ -372,6 +372,25 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
                 raise SnowflakeException(
                     tool="describe_object",
                     message="Provide target_object or database_name/schema_name/name. To list objects (e.g. schemas in a database), use list_objects instead.",
+                )
+        elif isinstance(target_object, str):
+            # Plain string (e.g. "INTEL") often means list intent when object_type is schema
+            try:
+                json.loads(target_object)
+            except (json.JSONDecodeError, TypeError):
+                if object_type == "schema":
+                    return list_objects(
+                        snowflake_service,
+                        "schema",
+                        target_object,
+                        None,
+                        None,
+                        None,
+                        headers=http_headers,
+                    )
+                raise SnowflakeException(
+                    tool="describe_object",
+                    message="target_object must be a JSON object or use database_name/schema_name/name. To list objects use list_objects.",
                 )
         target_object = parse_object(target_object, object_type)
         root = get_root(http_headers)
