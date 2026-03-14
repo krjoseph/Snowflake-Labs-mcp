@@ -1,5 +1,6 @@
 # Snowflake MCP Server Configuration
 # Minimal configuration - customize as needed
+# Set Create/Drop to true in sql_statement_permissions to expose create_object, drop_object, create_or_alter_object.
 
 agent_services: []
 search_services: []
@@ -10,7 +11,7 @@ other_services:
   query_manager: true
   semantic_manager: true
 
-sql_statement_permissions:
+sql_statement_permissions:  # Create/Drop false = read-only object manager (describe_object, list_objects only)
   - Alter: false
   - Command: false
   - Comment: true
