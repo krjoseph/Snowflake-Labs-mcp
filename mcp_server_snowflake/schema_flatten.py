@@ -23,6 +23,12 @@ from copy import deepcopy
 from typing import Any
 
 
+def _ensure_description_string(schema: dict[str, Any]) -> None:
+    """Ensure description is never None (JSON Schema requires string if present). Mutates in place."""
+    if "description" in schema and schema["description"] is None:
+        schema["description"] = ""
+
+
 def _is_object_schema(schema: dict[str, Any]) -> bool:
     """True if schema is or resolves to an object type."""
     if schema.get("type") == "object":
@@ -87,7 +93,29 @@ def _flatten_schema_node(schema: dict[str, Any], depth: int = 0) -> dict[str, An
         subs = [_flatten_schema_node(s, depth + 1) for s in schema[key]]
         if all(_is_object_schema(s) for s in subs):
             return _merge_object_schemas(subs)
-        # Mixed or non-object: use a permissive object so Claude accepts the tool
+        # anyOf/oneOf with primitives (e.g. string | null): keep first primitive type so
+        # optional string params stay "type": "string" instead of becoming "type": "object"
+        primitives = ("string", "number", "integer", "boolean", "array")
+        for s in subs:
+            t = s.get("type")
+            if t is None:
+                continue
+            if isinstance(t, list):
+                for u in t:
+                    if u in primitives:
+                        return {
+                            "type": u,
+                            "description": schema.get("description") or s.get("description") or "",
+                        }
+                continue
+            if t in primitives:
+                return {
+                    "type": t,
+                    "description": schema.get("description") or s.get("description") or "",
+                }
+            if t == "null":
+                continue
+        # Mixed or unknown: fallback to permissive object
         return {
             "type": "object",
             "description": schema.get("description") or "JSON object (structure may vary)",
@@ -99,13 +127,18 @@ def _flatten_schema_node(schema: dict[str, Any], depth: int = 0) -> dict[str, An
             k: _flatten_schema_node(v, depth + 1)
             for k, v in schema["properties"].items()
         }
+        for v in schema["properties"].values():
+            _ensure_description_string(v)
     if "items" in schema and isinstance(schema["items"], dict):
         schema["items"] = _flatten_schema_node(schema["items"], depth + 1)
+        _ensure_description_string(schema["items"])
     if "additionalProperties" in schema and isinstance(schema["additionalProperties"], dict):
         schema["additionalProperties"] = _flatten_schema_node(
             schema["additionalProperties"], depth + 1
         )
+        _ensure_description_string(schema["additionalProperties"])
 
+    _ensure_description_string(schema)
     return schema
 
 

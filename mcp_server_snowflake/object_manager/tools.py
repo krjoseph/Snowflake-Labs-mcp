@@ -185,19 +185,22 @@ def build_target_object_from_scope(
 ) -> dict:
     """Build target_object dict from scope params so callers can pass database_name/schema_name/name instead of target_object."""
     if object_type == "database":
-        if not name:
+        db_name = name or database_name
+        if not db_name:
             raise SnowflakeException(
                 tool="describe_object",
-                message="For object_type 'database' provide target_object or name (database name).",
+                message="For object_type 'database' provide target_object or name/database_name (the database name).",
             )
-        return {"name": name}
+        return {"name": db_name}
     if object_type == "schema":
-        if not database_name or not name:
-            msg = "For object_type 'schema' provide target_object or both database_name and name (schema name)."
-            if database_name and not name:
+        # Schema name can be passed as name or schema_name (matches function parameters)
+        schema_obj_name = name or schema_name
+        if not database_name or not schema_obj_name:
+            msg = "For object_type 'schema' provide target_object or both database_name and name/schema_name (the schema name)."
+            if database_name and not schema_obj_name:
                 msg += " To list schemas in a database, use list_objects with object_type 'schema' and database_name."
             raise SnowflakeException(tool="describe_object", message=msg)
-        return {"database_name": database_name, "name": name}
+        return {"database_name": database_name, "name": schema_obj_name}
     if object_type in ("table", "view"):
         if not database_name or not schema_name or not name:
             raise SnowflakeException(
@@ -256,14 +259,23 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     allow_drop = "drop" in sql_allowed
 
     def get_root(headers: dict = None):
-        """Get Root object, using headers for multi-tenant mode."""
+        """Get Root object, using headers for multi-tenant mode. Raises if connection unavailable."""
         if snowflake_service.transport == "streamable-http" and headers:
             try:
                 _, _, root = snowflake_service.get_connection_from_headers(headers)
                 return root
-            except Exception:
-                pass
-        return snowflake_service.root
+            except Exception as e:
+                raise SnowflakeException(
+                    tool="object_manager",
+                    message=f"Snowflake connection failed: {e}. For streamable-http transport ensure the request includes Authorization (Bearer token) and X-Snowflake-Account, X-Snowflake-User headers.",
+                )
+        root = snowflake_service.root
+        if root is None:
+            raise SnowflakeException(
+                tool="object_manager",
+                message="Snowflake connection not available. For streamable-http transport provide Authorization and X-Snowflake-* headers. For stdio ensure connection is configured.",
+            )
+        return root
     object_type_annotation = Annotated[
         supported_objects,
         Field(
@@ -349,14 +361,14 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
         schema_name: Annotated[
             str | None,
             Field(
-                description="Schema name. Use with database_name and name when not passing target_object.",
+                description="Schema name: for object_type schema this is the schema to describe; for table/view/stage/image_repository the schema containing the object. Use with database_name and name when not passing target_object.",
                 default=None,
             ),
         ] = None,
         name: Annotated[
             str | None,
             Field(
-                description="Object name (e.g. table name, schema name). Use with database_name (and schema_name for table/view) when not passing target_object.",
+                description="Object name (table name, view name, schema name, etc.). For schema use name or schema_name. Use with database_name (and schema_name for table/view) when not passing target_object.",
                 default=None,
             ),
         ] = None,
@@ -371,26 +383,22 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
             else:
                 raise SnowflakeException(
                     tool="describe_object",
-                    message="Provide target_object or database_name/schema_name/name. To list objects (e.g. schemas in a database), use list_objects instead.",
+                    message="Provide target_object or (database_name and, for schema/table/view/stage/image_repository, schema_name and object name). To list objects use list_objects.",
                 )
         elif isinstance(target_object, str):
-            # Plain string (e.g. "INTEL") often means list intent when object_type is schema
             try:
-                json.loads(target_object)
-            except (json.JSONDecodeError, TypeError):
-                if object_type == "schema":
-                    return list_objects(
-                        snowflake_service,
-                        "schema",
-                        target_object,
-                        None,
-                        None,
-                        None,
-                        headers=http_headers,
+                parsed = json.loads(target_object)
+                if isinstance(parsed, dict):
+                    target_object = parsed
+                else:
+                    raise SnowflakeException(
+                        tool="describe_object",
+                        message="target_object must be a JSON object with the object identity (e.g. database_name, schema_name, name). To list objects use list_objects.",
                     )
+            except (json.JSONDecodeError, TypeError):
                 raise SnowflakeException(
                     tool="describe_object",
-                    message="target_object must be a JSON object or use database_name/schema_name/name. To list objects use list_objects.",
+                    message="target_object must be a JSON object with the object identity (e.g. database_name, schema_name, name). To list objects use list_objects.",
                 )
         target_object = parse_object(target_object, object_type)
         root = get_root(http_headers)
@@ -402,8 +410,20 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     )
     def list_objects_tool(
         object_type: object_type_annotation,
-        database_name: str | None = None,
-        schema_name: str | None = None,
+        database_name: Annotated[
+            str | None,
+            Field(
+                description="Database name to scope the list (e.g. for object_type schema or table). Omit to list in account.",
+                default=None,
+            ),
+        ] = None,
+        schema_name: Annotated[
+            str | None,
+            Field(
+                description="Schema name to scope the list (e.g. for object_type table). Use with database_name.",
+                default=None,
+            ),
+        ] = None,
         like: Annotated[
             str | None,
             Field(

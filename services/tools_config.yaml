@@ -9,7 +9,7 @@ analyst_services: []
 other_services:
   object_manager: true
   query_manager: true
-  semantic_manager: true
+  semantic_manager: false
 
 sql_statement_permissions:  # Create/Drop false = read-only object manager (describe_object, list_objects only)
   - Alter: false
