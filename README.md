@@ -593,6 +593,12 @@ See [Connecting to Snowflake with the Python Connector](https://docs.snowflake.c
 - While LLMs' support for more tools will likely grow, you can hide tool groups by setting them to False in the configuration file.
 Only listed Cortex services will be made into tools as well.
 
+#### I see "claude-sonnet-4-5 does not support zod type: ZodIntersection" (or "input_schema does not support oneOf/allOf/anyOf at the top level").
+
+- This comes from a limitation in the **Anthropic API** and some MCP clients: tool input schemas must not use JSON Schema composition keywords (`oneOf`, `allOf`, `anyOf`) at the top level. When the client converts MCP tool schemas to Zod, `allOf` becomes `ZodIntersection`, which is then rejected when calling Claude.
+- **This MCP server flattens tool schemas automatically.** When tools are listed (`tools/list`), the server rewrites each tool's `inputSchema` to remove top-level and nested `oneOf`/`allOf`/`anyOf` by merging object branches into a single schema, so the server is compatible with claude-sonnet-4-5 and similar models when used with Cursor or other clients that send tool schemas to Claude. If you still see the error, try refreshing the tool list or reconnecting the MCP server.
+- The issue is also tracked in the [Anthropic Claude Code repo](https://github.com/anthropics/claude-code/issues/4886).
+
 #### Can I use a Programmatic Access Token (PAT) instead of a password?
 
 - Yes. Pass it to the CLI flag --password or set as environment variable SNOWFLAKE_PASSWORD.

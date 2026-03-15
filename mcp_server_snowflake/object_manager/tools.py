@@ -2,7 +2,6 @@ import json
 from typing import Annotated, Any, Literal, Optional, Union, get_args
 
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 from snowflake.core import CreateMode, Root
 
@@ -23,7 +22,7 @@ from mcp_server_snowflake.object_manager.objects import (
 from mcp_server_snowflake.object_manager.prompts import (
     get_object_mgmt_prompt,
 )
-from mcp_server_snowflake.utils import SnowflakeException, execute_query
+from mcp_server_snowflake.utils import get_request_headers_for_tools, SnowflakeException, execute_query
 
 
 def get_class_name(object_type: Any) -> str:
@@ -152,56 +151,131 @@ def list_objects(
         raise SnowflakeException(tool="list_objects", message=str(e))
 
 
+def _get_object_class(obj_type: supported_objects):
+    """Map object type string to Snowflake object model class."""
+    if obj_type == "database":
+        return SnowflakeDatabase
+    elif obj_type == "schema":
+        return SnowflakeSchema
+    elif obj_type == "table":
+        return SnowflakeTable
+    elif obj_type == "view":
+        return SnowflakeView
+    elif obj_type == "warehouse":
+        return SnowflakeWarehouse
+    elif obj_type == "compute_pool":
+        return SnowflakeComputePool
+    elif obj_type == "role":
+        return SnowflakeRole
+    elif obj_type == "stage":
+        return SnowflakeStage
+    elif obj_type == "user":
+        return SnowflakeUser
+    elif obj_type == "image_repository":
+        return SnowflakeImageRepository
+    else:
+        raise ValueError(f"Invalid object type: {obj_type}")
+
+
+def build_target_object_from_scope(
+    object_type: supported_objects,
+    database_name: str | None,
+    schema_name: str | None,
+    name: str | None,
+) -> dict:
+    """Build target_object dict from scope params so callers can pass database_name/schema_name/name instead of target_object."""
+    if object_type == "database":
+        db_name = name or database_name
+        if not db_name:
+            raise SnowflakeException(
+                tool="describe_object",
+                message="For object_type 'database' provide target_object or name/database_name (the database name).",
+            )
+        return {"name": db_name}
+    if object_type == "schema":
+        # Schema name can be passed as name or schema_name (matches function parameters)
+        schema_obj_name = name or schema_name
+        if not database_name or not schema_obj_name:
+            msg = "For object_type 'schema' provide target_object or both database_name and name/schema_name (the schema name)."
+            if database_name and not schema_obj_name:
+                msg += " To list schemas in a database, use list_objects with object_type 'schema' and database_name."
+            raise SnowflakeException(tool="describe_object", message=msg)
+        return {"database_name": database_name, "name": schema_obj_name}
+    if object_type in ("table", "view"):
+        if not database_name or not schema_name or not name:
+            raise SnowflakeException(
+                tool="describe_object",
+                message=f"For object_type '{object_type}' provide target_object or database_name, schema_name, and name.",
+            )
+        key = "table_name" if object_type == "table" else "view_name"
+        return {"database_name": database_name, "schema_name": schema_name, key: name}
+    if object_type in ("warehouse", "compute_pool", "role", "user"):
+        if not name:
+            raise SnowflakeException(
+                tool="describe_object",
+                message=f"For object_type '{object_type}' provide target_object or name.",
+            )
+        return {"name": name}
+    if object_type == "stage":
+        if not database_name or not schema_name or not name:
+            raise SnowflakeException(
+                tool="describe_object",
+                message="For object_type 'stage' provide target_object or database_name, schema_name, and name.",
+            )
+        return {"database_name": database_name, "schema_name": schema_name, "name": name}
+    if object_type == "image_repository":
+        if not database_name or not schema_name or not name:
+            raise SnowflakeException(
+                tool="describe_object",
+                message="For object_type 'image_repository' provide target_object or database_name, schema_name, and name.",
+            )
+        return {"database_name": database_name, "schema_name": schema_name, "name": name}
+    raise SnowflakeException(tool="describe_object", message=f"Unknown object_type: {object_type}")
+
+
 def parse_object(target_object: Any, obj_type: supported_objects):
-    """Parse a string into a Pydantic model.
-    If the target_object is a string, parse it into a Pydantic model.
+    """Parse target_object into a Pydantic model.
+    If the target_object is a string, parse JSON then into a Pydantic model.
+    If the target_object is a dict, convert it to the appropriate Pydantic model.
     If the target_object is already a Pydantic model, return it.
-    This is to handle the case where the LLM passes the object as a JSON string.
     """
     if isinstance(target_object, str):
         try:
-            if obj_type == "database":
-                obj_type = SnowflakeDatabase
-            elif obj_type == "schema":
-                obj_type = SnowflakeSchema
-            elif obj_type == "table":
-                obj_type = SnowflakeTable
-            elif obj_type == "view":
-                obj_type = SnowflakeView
-            elif obj_type == "warehouse":
-                obj_type = SnowflakeWarehouse
-            elif obj_type == "compute_pool":
-                obj_type = SnowflakeComputePool
-            elif obj_type == "role":
-                obj_type = SnowflakeRole
-            elif obj_type == "stage":
-                obj_type = SnowflakeStage
-            elif obj_type == "user":
-                obj_type = SnowflakeUser
-            elif obj_type == "image_repository":
-                obj_type = SnowflakeImageRepository
-            else:
-                raise ValueError(f"Invalid object type: {obj_type}")
             parsed_data = json.loads(target_object)
-            return obj_type(**parsed_data)
         except Exception as e:
             raise e
-    else:
-        return target_object
+        target_object = parsed_data
+    if isinstance(target_object, dict):
+        obj_class = _get_object_class(obj_type)
+        return obj_class(**target_object)
+    return target_object
 
 
 def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     supported_objects_list = list(get_args(supported_objects))
-    
+    sql_allowed = getattr(snowflake_service, "sql_statement_allowed", [])
+    # Only expose write/delete tools when config allows (Create/Drop in sql_statement_permissions)
+    allow_create = "create" in sql_allowed
+    allow_drop = "drop" in sql_allowed
+
     def get_root(headers: dict = None):
-        """Get Root object, using headers for multi-tenant mode."""
+        """Get Root object, using headers for multi-tenant mode. Raises if connection unavailable."""
         if snowflake_service.transport == "streamable-http" and headers:
             try:
                 _, _, root = snowflake_service.get_connection_from_headers(headers)
                 return root
-            except Exception:
-                pass
-        return snowflake_service.root
+            except Exception as e:
+                raise SnowflakeException(
+                    tool="object_manager",
+                    message=f"Snowflake connection failed: {e}. For streamable-http transport ensure the request includes Authorization (Bearer token) and X-Snowflake-Account, X-Snowflake-User headers.",
+                )
+        root = snowflake_service.root
+        if root is None:
+            raise SnowflakeException(
+                tool="object_manager",
+                message="Snowflake connection not available. For streamable-http transport provide Authorization and X-Snowflake-* headers. For stdio ensure connection is configured.",
+            )
+        return root
     object_type_annotation = Annotated[
         supported_objects,
         Field(
@@ -218,86 +292,58 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
             description="Always pass properties of target_object as an object, not a string"
         ),
     ]
+    optional_target_object_annotation = Annotated[
+        Union[str, None, *get_args(SnowflakeObject)],
+        Field(
+            description="Target object. Optional if database_name/schema_name/name are provided instead.",
+            default=None,
+        ),
+    ]
 
-    @server.tool(
-        name="create_object",
-        description=get_object_mgmt_prompt("create", supported_objects_list),
-    )
-    def create_object_tool(
-        object_type: object_type_annotation,
-        target_object: target_object_annotation,
-        mode: Literal[
-            "error_if_exists", "replace", "if_not_exists"
-        ] = "error_if_exists",
-        http_headers: Optional[dict] = None,
-    ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
-        # If string is passed, parse JSON and create object
-        target_object = parse_object(target_object, object_type)
-        root = get_root(http_headers)
-        return create_object(target_object, root, mode)
+    if allow_create:
+        @server.tool(
+            name="create_object",
+            description=get_object_mgmt_prompt("create", supported_objects_list),
+        )
+        def create_object_tool(
+            object_type: object_type_annotation,
+            target_object: target_object_annotation,
+            mode: Literal[
+                "error_if_exists", "replace", "if_not_exists"
+            ] = "error_if_exists",
+        ):
+            http_headers = get_request_headers_for_tools()
+            target_object = parse_object(target_object, object_type)
+            root = get_root(http_headers)
+            return create_object(target_object, root, mode)
 
-    @server.tool(
-        name="drop_object",
-        description=get_object_mgmt_prompt("drop", supported_objects_list),
-    )
-    def drop_object_tool(
-        object_type: object_type_annotation,
-        target_object: target_object_annotation,
-        if_exists: bool = False,
-        http_headers: Optional[dict] = None,
-    ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
-        target_object = parse_object(target_object, object_type)
-        root = get_root(http_headers)
-        return drop_object(target_object, root, if_exists)
+        @server.tool(
+            name="create_or_alter_object",
+            description=get_object_mgmt_prompt("create_or_alter", supported_objects_list),
+        )
+        def create_or_alter_object_tool(
+            object_type: object_type_annotation,
+            target_object: target_object_annotation,
+        ):
+            http_headers = get_request_headers_for_tools()
+            target_object = parse_object(target_object, object_type)
+            root = get_root(http_headers)
+            return create_or_alter_object(target_object, root)
 
-    @server.tool(
-        name="create_or_alter_object",
-        description=get_object_mgmt_prompt("create_or_alter", supported_objects_list),
-    )
-    def create_or_alter_object_tool(
-        object_type: object_type_annotation,
-        target_object: target_object_annotation,
-        http_headers: Optional[dict] = None,
-    ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
-        target_object = parse_object(target_object, object_type)
-        root = get_root(http_headers)
-        return create_or_alter_object(target_object, root)
+    if allow_drop:
+        @server.tool(
+            name="drop_object",
+            description=get_object_mgmt_prompt("drop", supported_objects_list),
+        )
+        def drop_object_tool(
+            object_type: object_type_annotation,
+            target_object: target_object_annotation,
+            if_exists: bool = False,
+        ):
+            http_headers = get_request_headers_for_tools()
+            target_object = parse_object(target_object, object_type)
+            root = get_root(http_headers)
+            return drop_object(target_object, root, if_exists)
 
     @server.tool(
         name="describe_object",
@@ -305,21 +351,55 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     )
     def describe_object_tool(
         object_type: object_type_annotation,
-        target_object: target_object_annotation,
-        http_headers: Optional[dict] = None,
+        database_name: Annotated[
+            str | None,
+            Field(
+                description="Database name. Use with schema_name and name (or alone for database object_type) when not passing target_object. For list_objects use the list_objects tool instead.",
+                default=None,
+            ),
+        ] = None,
+        schema_name: Annotated[
+            str | None,
+            Field(
+                description="Schema name: for object_type schema this is the schema to describe; for table/view/stage/image_repository the schema containing the object. Use with database_name and name when not passing target_object.",
+                default=None,
+            ),
+        ] = None,
+        name: Annotated[
+            str | None,
+            Field(
+                description="Object name (table name, view name, schema name, etc.). For schema use name or schema_name. Use with database_name (and schema_name for table/view) when not passing target_object.",
+                default=None,
+            ),
+        ] = None,
+        target_object: optional_target_object_annotation = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
+        http_headers = get_request_headers_for_tools()
+        if target_object is None:
+            if database_name is not None or schema_name is not None or name is not None:
+                target_object = build_target_object_from_scope(
+                    object_type, database_name, schema_name, name
+                )
+            else:
+                raise SnowflakeException(
+                    tool="describe_object",
+                    message="Provide target_object or (database_name and, for schema/table/view/stage/image_repository, schema_name and object name). To list objects use list_objects.",
+                )
+        elif isinstance(target_object, str):
             try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
+                parsed = json.loads(target_object)
+                if isinstance(parsed, dict):
+                    target_object = parsed
                 else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+                    raise SnowflakeException(
+                        tool="describe_object",
+                        message="target_object must be a JSON object with the object identity (e.g. database_name, schema_name, name). To list objects use list_objects.",
+                    )
+            except (json.JSONDecodeError, TypeError):
+                raise SnowflakeException(
+                    tool="describe_object",
+                    message="target_object must be a JSON object with the object identity (e.g. database_name, schema_name, name). To list objects use list_objects.",
+                )
         target_object = parse_object(target_object, object_type)
         root = get_root(http_headers)
         return describe_object(target_object, root)
@@ -330,8 +410,20 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
     )
     def list_objects_tool(
         object_type: object_type_annotation,
-        database_name: str | None = None,
-        schema_name: str | None = None,
+        database_name: Annotated[
+            str | None,
+            Field(
+                description="Database name to scope the list (e.g. for object_type schema or table). Omit to list in account.",
+                default=None,
+            ),
+        ] = None,
+        schema_name: Annotated[
+            str | None,
+            Field(
+                description="Schema name to scope the list (e.g. for object_type table). Use with database_name.",
+                default=None,
+            ),
+        ] = None,
         like: Annotated[
             str | None,
             Field(
@@ -346,20 +438,8 @@ def initialize_object_manager_tools(server: FastMCP, snowflake_service):
                 default=None,
             ),
         ] = None,
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return list_objects(
             snowflake_service,
             object_type,

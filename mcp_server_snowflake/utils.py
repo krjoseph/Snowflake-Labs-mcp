@@ -19,6 +19,7 @@ from typing import Awaitable, Callable, Optional, TypeVar, Union
 
 import requests
 import yaml
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from fastmcp.utilities.logging import get_logger
 from pydantic import BaseModel
 from typing_extensions import ParamSpec
@@ -27,6 +28,21 @@ logger = get_logger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+
+def get_request_headers_for_tools() -> dict:
+    """
+    Return current HTTP request headers (include_all=True) or empty dict.
+    For use as a FastMCP Depends() provider so the parameter is excluded from
+    the tool schema and not exposed to LLM tool calls (streamable-http transport).
+    """
+    try:
+        request = get_http_request()
+        if request:
+            return dict(request.headers)
+        return get_http_headers(include_all=True)
+    except Exception:
+        return {}
 
 
 def warn_deprecated_params() -> None:

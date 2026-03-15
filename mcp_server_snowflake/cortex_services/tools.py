@@ -16,6 +16,8 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 
+from mcp_server_snowflake.utils import get_request_headers_for_tools
+
 from mcp_server_snowflake.cortex_services.prompts import (
     cortex_search_filter_description,
     get_cortex_agent_description,
@@ -504,18 +506,8 @@ def initialize_cortex_agent_tool(server: FastMCP, snowflake_service):
             str | None,
             Field(description="Filter by service name starting with string (case-sensitive)"),
         ] = None,
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return list_cortex_agent_services(
             snowflake_service=snowflake_service,
             database_name=database_name,
@@ -584,18 +576,8 @@ def initialize_cortex_search_tool(server: FastMCP, snowflake_service):
             str | None,
             Field(description="Filter by service name starting with string (case-sensitive)"),
         ] = None,
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return list_cortex_search_services(
             snowflake_service=snowflake_service,
             database_name=database_name,

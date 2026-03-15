@@ -91,13 +91,15 @@ class SnowflakeTableColumn(SnowflakeColumn):
 
 
 class SnowflakeTable(ObjectMetadata):
+    """Table object. Use 'name' or 'table_name' for the table name (e.g. when describing)."""
+
     database_name: str = Field(description="The database the table belongs to")
     schema_name: str = Field(description="The schema the table belongs to")
     kind: Literal["PERMANENT", "TRANSIENT"] = Field(
         default="PERMANENT", description="The kind of table"
     )
     # Columns only used if creating a table
-    columns: list[SnowflakeTableColumn] = Field(
+    columns: list[SnowflakeTableColumn] | None = Field(
         default=None,
         description="The columns of the table. Should be a list of SnowflakeTableColumn objects.",
     )
@@ -108,6 +110,15 @@ class SnowflakeTable(ObjectMetadata):
         description="Specifies the retention period for the table so that Time Travel actions "
         "SELECT, CLONE, UNDROP can be performed on historical data in the table.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def table_name_into_name(cls, data):
+        """Accept 'table_name' as alias for 'name' so describe_object works when caller uses table_name."""
+        if isinstance(data, dict) and "table_name" in data and data.get("name") is None:
+            data = dict(data)
+            data["name"] = data.pop("table_name")
+        return data
 
     def get_core_object(self):
         if self.columns is not None:
@@ -124,6 +135,8 @@ class SnowflakeViewColumn(SnowflakeColumn):
 
 
 class SnowflakeView(ObjectMetadata):
+    """View object. Use 'name' or 'view_name' for the view name (e.g. when describing)."""
+
     database_name: str = Field(description="The database the view belongs to")
     schema_name: str = Field(description="The schema the view belongs to")
     query: str = Field(description="The SELECT query that defines the view")
@@ -131,11 +144,20 @@ class SnowflakeView(ObjectMetadata):
         default=None, description="The kind of view as PERMANENT or TEMPORARY"
     )
     # Columns only used if creating a view
-    columns: list[SnowflakeViewColumn] = Field(
+    columns: list[SnowflakeViewColumn] | None = Field(
         default=None,
         description="The columns of the view. Should be a list of SnowflakeViewColumn objects.",
     )
     secure: bool = Field(default=None, description="Whether the view is secure")
+
+    @model_validator(mode="before")
+    @classmethod
+    def view_name_into_name(cls, data):
+        """Accept 'view_name' as alias for 'name' so describe_object works when caller uses view_name."""
+        if isinstance(data, dict) and "view_name" in data and data.get("name") is None:
+            data = dict(data)
+            data["name"] = data.pop("view_name")
+        return data
 
     def get_core_object(self):
         if self.columns is not None:

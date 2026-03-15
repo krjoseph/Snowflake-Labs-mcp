@@ -1,7 +1,6 @@
 from typing import Annotated, Literal, Optional
 
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_http_headers, get_http_request
 from pydantic import Field
 
 from mcp_server_snowflake.semantic_manager.objects import SemanticExpression
@@ -9,7 +8,7 @@ from mcp_server_snowflake.semantic_manager.prompts import (
     query_semantic_view_prompt,
     write_semantic_view_query_prompt,
 )
-from mcp_server_snowflake.utils import SnowflakeException, execute_query
+from mcp_server_snowflake.utils import get_request_headers_for_tools, SnowflakeException, execute_query
 
 
 def list_semantic_views(
@@ -326,20 +325,8 @@ def initialize_semantic_manager_tools(server: FastMCP, snowflake_service):
                 default=None,
             ),
         ],
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return list_semantic_views(
             snowflake_service, database_name, schema_name, like, starts_with, headers=http_headers
         )
@@ -364,20 +351,8 @@ def initialize_semantic_manager_tools(server: FastMCP, snowflake_service):
                 description="The name of the schema to describe the semantic view in."
             ),
         ],
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return describe_semantic_view(
             snowflake_service, view_name, database_name, schema_name, headers=http_headers
         )
@@ -415,20 +390,8 @@ def initialize_semantic_manager_tools(server: FastMCP, snowflake_service):
                 default=None,
             ),
         ],
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return show_semantic_expressions(
             snowflake_service,
             "DIMENSIONS",
@@ -470,20 +433,8 @@ def initialize_semantic_manager_tools(server: FastMCP, snowflake_service):
                 default=None,
             ),
         ],
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return show_semantic_expressions(
             snowflake_service,
             "METRICS",
@@ -515,20 +466,8 @@ def initialize_semantic_manager_tools(server: FastMCP, snowflake_service):
         view_name: Annotated[
             str, Field(description="The name of the semantic view to get the DDL for.")
         ],
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return get_semantic_view_ddl(
             snowflake_service, view_name, database_name, schema_name, headers=http_headers
         )
@@ -660,20 +599,8 @@ def initialize_semantic_manager_tools(server: FastMCP, snowflake_service):
                 description="Optional LIMIT for number of rows to return.", default=None
             ),
         ],
-        http_headers: Optional[dict] = None,
     ):
-        # Get headers if not provided (for multi-tenant mode)
-        if http_headers is None:
-            try:
-                # Try to get headers from HTTP request directly
-                request = get_http_request()
-                if request:
-                    http_headers = dict(request.headers)
-                else:
-                    # Fallback to get_http_headers()
-                    http_headers = get_http_headers(include_all=True)
-            except Exception:
-                http_headers = {}
+        http_headers = get_request_headers_for_tools()
         return query_semantic_view(
             snowflake_service,
             view_name,

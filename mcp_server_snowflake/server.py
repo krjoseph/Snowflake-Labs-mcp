@@ -581,7 +581,8 @@ class SnowflakeService:
         logger.debug(f"Raw headers received: {list(headers.keys())}")
         creds = self.extract_credentials_from_headers(headers)
         
-        logger.info(f"Extracted credentials - account: {creds.get('account')}, user: {creds.get('user')}, role: {creds.get('role')}, warehouse: {creds.get('warehouse')}, token_present: {bool(creds.get('token'))}, token_length: {len(creds.get('token', ''))}, token_start: {creds.get('token', '')[:30] if creds.get('token') else 'None'}...")
+        token_val = creds.get("token") or ""
+        logger.info(f"Extracted credentials - account: {creds.get('account')}, user: {creds.get('user')}, role: {creds.get('role')}, warehouse: {creds.get('warehouse')}, token_present: {bool(token_val)}, token_length: {len(token_val)}, token_start: {token_val[:30] + '...' if len(token_val) > 30 else (token_val or 'None')}")
         
         if not creds.get("token"):
             logger.error(f"Missing token. Available headers: {list(headers.keys())}")
